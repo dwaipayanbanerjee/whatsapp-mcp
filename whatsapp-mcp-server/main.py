@@ -1,3 +1,4 @@
+import logging
 import os
 import signal
 import sys
@@ -420,6 +421,14 @@ def shutdown_handler(signum, frame):
 
 
 if __name__ == "__main__":
+    # All logging goes to stderr: on the stdio transport, stdout carries the
+    # MCP JSON-RPC stream and any stray output corrupts protocol framing.
+    logging.basicConfig(
+        level=logging.INFO,
+        stream=sys.stderr,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
     # Register signal handlers for clean shutdown
     signal.signal(signal.SIGINT, shutdown_handler)
     signal.signal(signal.SIGTERM, shutdown_handler)

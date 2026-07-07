@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import os.path
 import sqlite3
@@ -9,6 +10,11 @@ from typing import Any
 import requests
 
 import audio
+
+# Never print() in this module: on the stdio transport, stdout carries the
+# MCP JSON-RPC stream and any stray output corrupts protocol framing.
+# Logging goes to stderr (configured in main.py).
+logger = logging.getLogger(__name__)
 
 # Configuration via environment variables with sensible defaults
 _DEFAULT_BRIDGE_STORE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "whatsapp-bridge", "store")
@@ -313,43 +319,11 @@ def get_sender_name(sender_jid: str) -> str:
         return sender_jid
 
     except sqlite3.Error as e:
-        print(f"Database error while getting sender name: {e}")
+        logger.warning("Database error while getting sender name: %s", e)
         return sender_jid
     finally:
         if "conn" in locals():
             conn.close()
-
-
-def format_message(message: Message, show_chat_info: bool = True) -> None:
-    """Print a single message with consistent formatting."""
-    output = ""
-
-    if show_chat_info and message.chat_name:
-        output += f"[{message.timestamp:%Y-%m-%d %H:%M:%S}] Chat: {message.chat_name} "
-    else:
-        output += f"[{message.timestamp:%Y-%m-%d %H:%M:%S}] "
-
-    content_prefix = ""
-    if hasattr(message, "media_type") and message.media_type:
-        content_prefix = f"[{message.media_type} - Message ID: {message.id} - Chat JID: {message.chat_jid}] "
-
-    try:
-        sender_name = get_sender_name(message.sender) if not message.is_from_me else "Me"
-        output += f"From: {sender_name}: {content_prefix}{message.content}\n"
-    except Exception as e:
-        print(f"Error formatting message: {e}")
-    return output
-
-
-def format_messages_list(messages: list[Message], show_chat_info: bool = True) -> None:
-    output = ""
-    if not messages:
-        output += "No messages to display."
-        return output
-
-    for message in messages:
-        output += format_message(message, show_chat_info)
-    return output
 
 
 def list_messages(
@@ -483,7 +457,7 @@ def list_messages(
         return [msg_to_dict(msg) for msg in result]
 
     except sqlite3.Error as e:
-        print(f"Database error: {e}")
+        logger.warning("Database error: %s", e)
         return []
     finally:
         if "conn" in locals():
@@ -587,7 +561,7 @@ def get_message_context(message_id: str, before: int = 5, after: int = 5) -> Mes
         return MessageContext(message=target_message, before=before_messages, after=after_messages)
 
     except sqlite3.Error as e:
-        print(f"Database error: {e}")
+        logger.warning("Database error: %s", e)
         raise
     finally:
         if "conn" in locals():
@@ -681,7 +655,7 @@ def list_chats(
         return result
 
     except sqlite3.Error as e:
-        print(f"Database error: {e}")
+        logger.warning("Database error: %s", e)
         return []
     finally:
         if "conn" in locals():
@@ -722,7 +696,7 @@ def search_contacts(query: str) -> list[dict[str, Any]]:
                 contact = Contact(phone_number=jid.split("@")[0], name=name, jid=jid)
                 result.append(contact_to_dict(contact))
     except sqlite3.Error as e:
-        print(f"Database error (messages.db): {e}")
+        logger.warning("Database error (messages.db): %s", e)
     finally:
         if "conn" in locals():
             conn.close()
@@ -753,7 +727,7 @@ def search_contacts(query: str) -> list[dict[str, Any]]:
                     contact = Contact(phone_number=their_jid.split("@")[0], name=name, jid=their_jid)
                     result.append(contact_to_dict(contact))
         except sqlite3.Error as e:
-            print(f"Database error (whatsapp.db): {e}")
+            logger.warning("Database error (whatsapp.db): %s", e)
         finally:
             if "conn2" in locals():
                 conn2.close()
@@ -816,7 +790,7 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> list[dict[str
         return result
 
     except sqlite3.Error as e:
-        print(f"Database error: {e}")
+        logger.warning("Database error: %s", e)
         return []
     finally:
         if "conn" in locals():
@@ -877,7 +851,7 @@ def get_last_interaction(jid: str) -> dict[str, Any] | None:
         return msg_to_dict(message)
 
     except sqlite3.Error as e:
-        print(f"Database error: {e}")
+        logger.warning("Database error: %s", e)
         return None
     finally:
         if "conn" in locals():
@@ -936,7 +910,7 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> dict[str, Any]
         return chat_to_dict(chat)
 
     except sqlite3.Error as e:
-        print(f"Database error: {e}")
+        logger.warning("Database error: %s", e)
         return None
     finally:
         if "conn" in locals():
@@ -983,7 +957,7 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> dict[str, Any] | Non
         return chat_to_dict(chat)
 
     except sqlite3.Error as e:
-        print(f"Database error: {e}")
+        logger.warning("Database error: %s", e)
         return None
     finally:
         if "conn" in locals():
@@ -1172,21 +1146,21 @@ def download_media(message_id: str, chat_jid: str) -> str | None:
             result = response.json()
             if result.get("success", False):
                 path = result.get("path")
-                print(f"Media downloaded successfully: {path}")
+                logger.info("Media downloaded successfully: %s", path)
                 return path
             else:
-                print(f"Download failed: {result.get('message', 'Unknown error')}")
+                logger.warning("Download failed: %s", result.get("message", "Unknown error"))
                 return None
         else:
-            print(f"Error: HTTP {response.status_code} - {response.text}")
+            logger.warning("Error: HTTP %s - %s", response.status_code, response.text)
             return None
 
     except requests.RequestException as e:
-        print(f"Request error: {str(e)}")
+        logger.warning("Request error: %s", e)
         return None
     except json.JSONDecodeError:
-        print(f"Error parsing response: {response.text}")
+        logger.warning("Error parsing response: %s", response.text)
         return None
     except Exception as e:
-        print(f"Unexpected error: {str(e)}")
+        logger.warning("Unexpected error: %s", e)
         return None
