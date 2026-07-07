@@ -3,6 +3,7 @@ import os
 import os.path
 import sqlite3
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -1092,6 +1093,18 @@ def send_file(recipient: str, media_path: str) -> tuple[bool, str]:
     return _send_payload({"recipient": recipient, "media_path": media_path})
 
 
+def _outbox_dir() -> str:
+    """The first allowed media root — where outbound files must live for the
+    bridge's media-path confinement to accept them."""
+    env = os.getenv("WHATSAPP_MEDIA_ROOTS", "").strip()
+    if env:
+        for raw in env.split(os.pathsep):
+            raw = raw.strip()
+            if raw:
+                return raw
+    return os.path.join(os.path.expanduser("~"), ".local", "share", "whatsapp-mcp", "outbox")
+
+
 def send_audio_message(recipient: str, media_path: str) -> tuple[bool, str]:
     if not recipient:
         return False, "Recipient must be provided"
@@ -1102,13 +1115,29 @@ def send_audio_message(recipient: str, media_path: str) -> tuple[bool, str]:
     if not os.path.isfile(media_path):
         return False, f"Media file not found: {media_path}"
 
+    converted_path: str | None = None
     if not media_path.endswith(".ogg"):
+        # Convert into the outbox, not the system temp dir: the bridge only
+        # reads media from its allowed roots and would reject a temp path
+        # with 403, breaking every non-.ogg voice message.
         try:
-            media_path = audio.convert_to_opus_ogg_temp(media_path)
+            outbox = _outbox_dir()
+            os.makedirs(outbox, mode=0o700, exist_ok=True)
+            converted_path = os.path.join(outbox, f"voice_{uuid.uuid4().hex}.ogg")
+            audio.convert_to_opus_ogg(media_path, converted_path)
         except Exception as e:
+            if converted_path and os.path.exists(converted_path):
+                os.unlink(converted_path)
             return False, f"Error converting file to opus ogg. You likely need to install ffmpeg: {str(e)}"
+        media_path = converted_path
 
-    return _send_payload({"recipient": recipient, "media_path": media_path})
+    try:
+        return _send_payload({"recipient": recipient, "media_path": media_path})
+    finally:
+        # The bridge reads the file before responding, so the converted
+        # temp copy can be removed as soon as the call returns.
+        if converted_path and os.path.exists(converted_path):
+            os.unlink(converted_path)
 
 
 def send_reaction(

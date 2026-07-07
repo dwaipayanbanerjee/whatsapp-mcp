@@ -258,8 +258,10 @@ Send a voice message (automatically converts to Opus .ogg format).
 - `recipient` (required): Phone number or group JID
 - `file_path` (required): Path to audio file
 
-Converted audio is sent through the same media-path confinement as
-`send_file`.
+Non-`.ogg` input is converted into the outbox (the first entry of
+`WHATSAPP_MEDIA_ROOTS`) so the bridge's media-path confinement accepts it;
+the converted copy is deleted after sending. `.ogg` input is sent as-is and
+must already live inside a configured media root, like `send_file`.
 
 #### `download_media`
 
