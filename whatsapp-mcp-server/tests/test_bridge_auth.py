@@ -61,7 +61,7 @@ def test_send_message_without_token_surfaces_bridge_401(monkeypatch, tmp_path):
     monkeypatch.delenv("WHATSAPP_BRIDGE_TOKEN", raising=False)
     monkeypatch.setattr(whatsapp, "_BRIDGE_TOKEN_PATH", str(missing_token))
 
-    def fake_post(url, json, headers=None):
+    def fake_post(url, json, headers=None, timeout=None):
         calls.append({"url": url, "json": json, "headers": headers})
         return DummyResponse(status_code=401, payload={"success": False}, text="Unauthorized")
 
@@ -91,7 +91,7 @@ def test_bridge_post_helpers_include_auth_headers(monkeypatch, tmp_path, func_na
     resolved_args = tuple(str(media_file) if arg == "FILE" else arg for arg in args)
     monkeypatch.setenv("WHATSAPP_BRIDGE_TOKEN", "env-token")
 
-    def fake_post(url, json, headers=None):
+    def fake_post(url, json, headers=None, timeout=None):
         calls.append({"url": url, "json": json, "headers": headers})
         return DummyResponse()
 
@@ -103,12 +103,45 @@ def test_bridge_post_helpers_include_auth_headers(monkeypatch, tmp_path, func_na
     assert calls[0]["headers"] == {"Authorization": "Bearer env-token"}
 
 
+def test_bridge_post_sets_timeout(monkeypatch):
+    """Every bridge call must carry a timeout so a hung bridge can't block
+    the MCP tool call forever."""
+    calls = []
+    monkeypatch.setenv("WHATSAPP_BRIDGE_TOKEN", "test-token")
+
+    def fake_post(url, json, headers=None, timeout=None):
+        calls.append(timeout)
+        return DummyResponse()
+
+    monkeypatch.setattr(whatsapp.requests, "post", fake_post)
+
+    whatsapp.send_message("12025551234", "hello")
+
+    assert calls[0] == whatsapp._BRIDGE_TIMEOUT
+    assert calls[0] is not None
+
+
+def test_bridge_post_surfaces_request_exception(monkeypatch):
+    """Transport-level failures return (False, message) instead of raising."""
+    monkeypatch.setenv("WHATSAPP_BRIDGE_TOKEN", "test-token")
+
+    def fake_post(url, json, headers=None, timeout=None):
+        raise whatsapp.requests.ConnectionError("bridge is down")
+
+    monkeypatch.setattr(whatsapp.requests, "post", fake_post)
+
+    success, message = whatsapp.send_message("12025551234", "hello")
+
+    assert success is False
+    assert "Request error" in message
+
+
 def test_send_reaction_posts_correct_payload(monkeypatch):
     """send_reaction sends recipient, message_id, emoji, from_me, sender_jid to /react."""
     calls = []
     monkeypatch.setenv("WHATSAPP_BRIDGE_TOKEN", "test-token")
 
-    def fake_post(url, json, headers=None):
+    def fake_post(url, json, headers=None, timeout=None):
         calls.append({"url": url, "json": json, "headers": headers})
         return DummyResponse(payload={"ok": True})
 
@@ -139,7 +172,7 @@ def test_send_reaction_empty_emoji_sends_removal(monkeypatch):
     calls = []
     monkeypatch.setenv("WHATSAPP_BRIDGE_TOKEN", "test-token")
 
-    def fake_post(url, json, headers=None):
+    def fake_post(url, json, headers=None, timeout=None):
         calls.append({"url": url, "json": json})
         return DummyResponse(payload={"ok": True})
 
@@ -170,7 +203,7 @@ def test_send_message_with_quoted_reply_includes_quote_fields(monkeypatch):
     calls = []
     monkeypatch.setenv("WHATSAPP_BRIDGE_TOKEN", "test-token")
 
-    def fake_post(url, json, headers=None):
+    def fake_post(url, json, headers=None, timeout=None):
         calls.append({"url": url, "json": json, "headers": headers})
         return DummyResponse()
 
@@ -199,7 +232,7 @@ def test_send_message_without_quote_omits_quote_fields(monkeypatch):
     calls = []
     monkeypatch.setenv("WHATSAPP_BRIDGE_TOKEN", "test-token")
 
-    def fake_post(url, json, headers=None):
+    def fake_post(url, json, headers=None, timeout=None):
         calls.append({"url": url, "json": json})
         return DummyResponse()
 

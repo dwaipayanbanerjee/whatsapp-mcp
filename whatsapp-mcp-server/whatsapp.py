@@ -1,4 +1,3 @@
-import json
 import logging
 import os
 import os.path
@@ -50,6 +49,32 @@ def _bridge_headers() -> dict[str, str]:
     if not token:
         return {}
     return {"Authorization": f"Bearer {token}"}
+
+
+# Timeouts for bridge REST calls: (connect, read) in seconds. Sends upload
+# media to WhatsApp's servers and downloads pull from its CDN, both of which
+# can legitimately take a while — but without a read timeout a hung bridge
+# would block the MCP tool call (and the agent driving it) forever.
+_BRIDGE_TIMEOUT = (5, 120)
+
+
+def _bridge_post(endpoint: str, payload: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+    """POST to the bridge REST API and decode the JSON response.
+
+    Returns (response_dict, None) on HTTP 200, or (None, error_message) on
+    transport errors, non-200 statuses, and undecodable bodies.
+    """
+    url = f"{WHATSAPP_API_BASE_URL}/{endpoint}"
+    try:
+        response = requests.post(url, json=payload, headers=_bridge_headers(), timeout=_BRIDGE_TIMEOUT)
+    except requests.RequestException as e:
+        return None, f"Request error: {e}"
+    if response.status_code != 200:
+        return None, f"Error: HTTP {response.status_code} - {response.text}"
+    try:
+        return response.json(), None
+    except ValueError:
+        return None, f"Error parsing response: {response.text}"
 
 
 @dataclass
@@ -964,6 +989,14 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> dict[str, Any] | Non
             conn.close()
 
 
+def _send_payload(payload: dict[str, Any]) -> tuple[bool, str]:
+    """POST a payload to /api/send and normalize the (success, message) reply."""
+    result, error = _bridge_post("send", payload)
+    if error:
+        return False, error
+    return result.get("success", False), result.get("message", "Unknown response")
+
+
 def send_message(
     recipient: str,
     message: str,
@@ -971,106 +1004,51 @@ def send_message(
     quoted_sender_jid: str = "",
     quoted_content: str = "",
 ) -> tuple[bool, str]:
-    try:
-        # Validate input
-        if not recipient:
-            return False, "Recipient must be provided"
+    if not recipient:
+        return False, "Recipient must be provided"
 
-        url = f"{WHATSAPP_API_BASE_URL}/send"
-        payload: dict[str, Any] = {
-            "recipient": recipient,
-            "message": message,
-        }
-        if quoted_message_id:
-            payload["quoted_message_id"] = quoted_message_id
-            payload["quoted_sender_jid"] = quoted_sender_jid
-            payload["quoted_content"] = quoted_content
+    payload: dict[str, Any] = {
+        "recipient": recipient,
+        "message": message,
+    }
+    if quoted_message_id:
+        payload["quoted_message_id"] = quoted_message_id
+        payload["quoted_sender_jid"] = quoted_sender_jid
+        payload["quoted_content"] = quoted_content
 
-        response = requests.post(url, json=payload, headers=_bridge_headers())
-
-        # Check if the request was successful
-        if response.status_code == 200:
-            result = response.json()
-            return result.get("success", False), result.get("message", "Unknown response")
-        else:
-            return False, f"Error: HTTP {response.status_code} - {response.text}"
-
-    except requests.RequestException as e:
-        return False, f"Request error: {str(e)}"
-    except json.JSONDecodeError:
-        return False, f"Error parsing response: {response.text}"
-    except Exception as e:
-        return False, f"Unexpected error: {str(e)}"
+    return _send_payload(payload)
 
 
 def send_file(recipient: str, media_path: str) -> tuple[bool, str]:
-    try:
-        # Validate input
-        if not recipient:
-            return False, "Recipient must be provided"
+    if not recipient:
+        return False, "Recipient must be provided"
 
-        if not media_path:
-            return False, "Media path must be provided"
+    if not media_path:
+        return False, "Media path must be provided"
 
-        if not os.path.isfile(media_path):
-            return False, f"Media file not found: {media_path}"
+    if not os.path.isfile(media_path):
+        return False, f"Media file not found: {media_path}"
 
-        url = f"{WHATSAPP_API_BASE_URL}/send"
-        payload = {"recipient": recipient, "media_path": media_path}
-
-        response = requests.post(url, json=payload, headers=_bridge_headers())
-
-        # Check if the request was successful
-        if response.status_code == 200:
-            result = response.json()
-            return result.get("success", False), result.get("message", "Unknown response")
-        else:
-            return False, f"Error: HTTP {response.status_code} - {response.text}"
-
-    except requests.RequestException as e:
-        return False, f"Request error: {str(e)}"
-    except json.JSONDecodeError:
-        return False, f"Error parsing response: {response.text}"
-    except Exception as e:
-        return False, f"Unexpected error: {str(e)}"
+    return _send_payload({"recipient": recipient, "media_path": media_path})
 
 
 def send_audio_message(recipient: str, media_path: str) -> tuple[bool, str]:
-    try:
-        # Validate input
-        if not recipient:
-            return False, "Recipient must be provided"
+    if not recipient:
+        return False, "Recipient must be provided"
 
-        if not media_path:
-            return False, "Media path must be provided"
+    if not media_path:
+        return False, "Media path must be provided"
 
-        if not os.path.isfile(media_path):
-            return False, f"Media file not found: {media_path}"
+    if not os.path.isfile(media_path):
+        return False, f"Media file not found: {media_path}"
 
-        if not media_path.endswith(".ogg"):
-            try:
-                media_path = audio.convert_to_opus_ogg_temp(media_path)
-            except Exception as e:
-                return False, f"Error converting file to opus ogg. You likely need to install ffmpeg: {str(e)}"
+    if not media_path.endswith(".ogg"):
+        try:
+            media_path = audio.convert_to_opus_ogg_temp(media_path)
+        except Exception as e:
+            return False, f"Error converting file to opus ogg. You likely need to install ffmpeg: {str(e)}"
 
-        url = f"{WHATSAPP_API_BASE_URL}/send"
-        payload = {"recipient": recipient, "media_path": media_path}
-
-        response = requests.post(url, json=payload, headers=_bridge_headers())
-
-        # Check if the request was successful
-        if response.status_code == 200:
-            result = response.json()
-            return result.get("success", False), result.get("message", "Unknown response")
-        else:
-            return False, f"Error: HTTP {response.status_code} - {response.text}"
-
-    except requests.RequestException as e:
-        return False, f"Request error: {str(e)}"
-    except json.JSONDecodeError:
-        return False, f"Error parsing response: {response.text}"
-    except Exception as e:
-        return False, f"Unexpected error: {str(e)}"
+    return _send_payload({"recipient": recipient, "media_path": media_path})
 
 
 def send_reaction(
@@ -1093,37 +1071,25 @@ def send_reaction(
     Returns:
         Tuple of (success, status_message).
     """
-    try:
-        if not recipient:
-            return False, "Recipient must be provided"
-        if not message_id:
-            return False, "Message ID must be provided"
+    if not recipient:
+        return False, "Recipient must be provided"
+    if not message_id:
+        return False, "Message ID must be provided"
 
-        url = f"{WHATSAPP_API_BASE_URL}/react"
-        payload: dict[str, Any] = {
-            "recipient": recipient,
-            "message_id": message_id,
-            "emoji": emoji,
-            "from_me": from_me,
-            "sender_jid": sender_jid,
-        }
+    payload: dict[str, Any] = {
+        "recipient": recipient,
+        "message_id": message_id,
+        "emoji": emoji,
+        "from_me": from_me,
+        "sender_jid": sender_jid,
+    }
 
-        response = requests.post(url, json=payload, headers=_bridge_headers())
-
-        if response.status_code == 200:
-            result = response.json()
-            if result.get("ok"):
-                return True, "Reaction sent"
-            return False, result.get("error", "Unknown error")
-        else:
-            return False, f"Error: HTTP {response.status_code} - {response.text}"
-
-    except requests.RequestException as e:
-        return False, f"Request error: {str(e)}"
-    except json.JSONDecodeError:
-        return False, f"Error parsing response: {response.text}"
-    except Exception as e:
-        return False, f"Unexpected error: {str(e)}"
+    result, error = _bridge_post("react", payload)
+    if error:
+        return False, error
+    if result.get("ok"):
+        return True, "Reaction sent"
+    return False, result.get("error", "Unknown error")
 
 
 def download_media(message_id: str, chat_jid: str) -> str | None:
@@ -1136,31 +1102,13 @@ def download_media(message_id: str, chat_jid: str) -> str | None:
     Returns:
         The local file path if download was successful, None otherwise
     """
-    try:
-        url = f"{WHATSAPP_API_BASE_URL}/download"
-        payload = {"message_id": message_id, "chat_jid": chat_jid}
-
-        response = requests.post(url, json=payload, headers=_bridge_headers())
-
-        if response.status_code == 200:
-            result = response.json()
-            if result.get("success", False):
-                path = result.get("path")
-                logger.info("Media downloaded successfully: %s", path)
-                return path
-            else:
-                logger.warning("Download failed: %s", result.get("message", "Unknown error"))
-                return None
-        else:
-            logger.warning("Error: HTTP %s - %s", response.status_code, response.text)
-            return None
-
-    except requests.RequestException as e:
-        logger.warning("Request error: %s", e)
+    result, error = _bridge_post("download", {"message_id": message_id, "chat_jid": chat_jid})
+    if error:
+        logger.warning("Download failed: %s", error)
         return None
-    except json.JSONDecodeError:
-        logger.warning("Error parsing response: %s", response.text)
-        return None
-    except Exception as e:
-        logger.warning("Unexpected error: %s", e)
-        return None
+    if result.get("success", False):
+        path = result.get("path")
+        logger.info("Media downloaded successfully: %s", path)
+        return path
+    logger.warning("Download failed: %s", result.get("message", "Unknown error"))
+    return None
