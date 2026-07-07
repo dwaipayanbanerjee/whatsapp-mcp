@@ -82,16 +82,6 @@ func getEnvBool(key string, def bool) bool {
 	}
 }
 
-// Message represents a chat message for our client
-type Message struct {
-	Time      time.Time
-	Sender    string
-	Content   string
-	IsFromMe  bool
-	MediaType string
-	Filename  string
-}
-
 // Database handler for storing message history
 type MessageStore struct {
 	db   *sql.DB
@@ -734,32 +724,6 @@ func (store *MessageStore) MarkMessageDeleted(messageID, chatJID string, deleted
 	return err
 }
 
-// Get messages from a chat
-func (store *MessageStore) GetMessages(chatJID string, limit int) ([]Message, error) {
-	rows, err := store.db.Query(
-		"SELECT sender, content, timestamp, is_from_me, media_type, filename FROM messages WHERE chat_jid = ? ORDER BY timestamp DESC LIMIT ?",
-		chatJID, limit,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = rows.Close() }()
-
-	var messages []Message
-	for rows.Next() {
-		var msg Message
-		var timestamp time.Time
-		err := rows.Scan(&msg.Sender, &msg.Content, &timestamp, &msg.IsFromMe, &msg.MediaType, &msg.Filename)
-		if err != nil {
-			return nil, err
-		}
-		msg.Time = timestamp
-		messages = append(messages, msg)
-	}
-
-	return messages, nil
-}
-
 // Call storage methods.
 //
 // WhatsApp calls arrive as a sequence of events: Offer/OfferNotice → Accept →
@@ -828,35 +792,6 @@ func (store *MessageStore) MarkCallTerminated(callID, chatJID, reason string, en
 		endedAt, endedAt, reason, callID, chatJID,
 	)
 	return err
-}
-
-// Get all chats
-func (store *MessageStore) GetChats() (map[string]time.Time, error) {
-	rows, err := store.db.Query("SELECT jid, last_message_time FROM chats ORDER BY last_message_time DESC")
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = rows.Close() }()
-
-	chats := make(map[string]time.Time)
-	for rows.Next() {
-		var jid string
-		// last_message_time can be NULL — UpdateChatEphemeralSettings can
-		// create a chat row from a GroupInfo / ephemeral-setting event
-		// before any message has landed for that chat.
-		var lastMessageTime sql.NullTime
-		err := rows.Scan(&jid, &lastMessageTime)
-		if err != nil {
-			return nil, err
-		}
-		if lastMessageTime.Valid {
-			chats[jid] = lastMessageTime.Time
-		} else {
-			chats[jid] = time.Time{}
-		}
-	}
-
-	return chats, nil
 }
 
 // Extract text content from a message
@@ -3114,14 +3049,6 @@ func analyzeOggOpus(data []byte) (duration uint32, waveform []byte, err error) {
 		len(data), duration, len(waveform))
 
 	return duration, waveform, nil
-}
-
-// min returns the smaller of x or y
-func min(x, y int) int {
-	if x < y {
-		return x
-	}
-	return y
 }
 
 // placeholderWaveform generates a synthetic waveform for WhatsApp voice messages
