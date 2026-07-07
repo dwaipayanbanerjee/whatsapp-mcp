@@ -11,6 +11,9 @@ from whatsapp import (
     download_media as whatsapp_download_media,
 )
 from whatsapp import (
+    get_bridge_status as whatsapp_get_bridge_status,
+)
+from whatsapp import (
     get_chat as whatsapp_get_chat,
 )
 from whatsapp import (
@@ -27,6 +30,9 @@ from whatsapp import (
 )
 from whatsapp import (
     get_sender_name as whatsapp_get_sender_name,
+)
+from whatsapp import (
+    list_calls as whatsapp_list_calls,
 )
 from whatsapp import (
     list_chats as whatsapp_list_chats,
@@ -413,6 +419,49 @@ def download_media(message_id: str, chat_jid: str) -> dict[str, Any]:
         return {"success": True, "message": "Media downloaded successfully", "file_path": file_path}
     else:
         return {"success": False, "message": "Failed to download media"}
+
+
+@mcp.tool()
+def list_calls(
+    after: str | None = None,
+    before: str | None = None,
+    call_type: str | None = None,
+    limit: int = 50,
+    page: int = 0,
+) -> list[dict[str, Any]]:
+    """Get WhatsApp call history (incoming voice/video calls captured by the bridge).
+
+    Args:
+        after: ISO-8601 date string — only calls after this time (e.g., "2026-01-01")
+        before: ISO-8601 date string — only calls before this time
+        call_type: Filter by "voice" or "video"
+        limit: Max calls to return (default 50, max 200)
+        page: Page number for pagination (default 0)
+
+    Returns:
+        Call dictionaries with from_jid, from_name, timestamp, call_type, is_group,
+        result ("in_progress", "answered", "ended", "missed", or "rejected"),
+        duration_sec, and ended_at. Outbound calls are not captured — WhatsApp
+        does not notify linked devices about calls the phone initiates.
+    """
+    limit = min(limit, 200)
+    return whatsapp_list_calls(after=after, before=before, call_type=call_type, limit=limit, page=page)
+
+
+@mcp.tool()
+def get_bridge_status() -> dict[str, Any]:
+    """Check the health of the WhatsApp bridge and the local message archive.
+
+    Use this to diagnose problems before or after other tools fail: it reports
+    whether the bridge REST API is reachable, whether it is connected to
+    WhatsApp, and whether the local message database exists and has data.
+
+    Returns:
+        Dictionary with bridge_reachable, whatsapp_connected, api_url,
+        messages_db_path, messages_db_exists, message_count, chat_count,
+        last_message_time, and error details when something is wrong.
+    """
+    return whatsapp_get_bridge_status()
 
 
 def shutdown_handler(signum, frame):

@@ -325,6 +325,42 @@ Get messages around a specific message for context.
 - `before` (optional): Number of messages before (default 5)
 - `after` (optional): Number of messages after (default 5)
 
+### Call & Status Operations
+
+#### `list_calls`
+
+Get incoming voice/video call history captured by the bridge (see [Call History](#call-history)).
+
+**Parameters:**
+
+- `after` (optional): ISO-8601 date string — only calls after this time
+- `before` (optional): ISO-8601 date string — only calls before this time
+- `call_type` (optional): `"voice"` or `"video"`
+- `limit` (optional): Max calls to return (default 50, max 200)
+- `page` (optional): Page number for pagination (default 0)
+
+Each call includes `from_jid`, `from_name`, `timestamp`, `call_type`, `is_group`,
+`result` (`in_progress` | `answered` | `ended` | `missed` | `rejected`),
+`duration_sec`, and `ended_at`. Outbound calls are not captured — WhatsApp does
+not notify linked devices about calls the phone initiates.
+
+**Natural Language Examples:**
+
+- "Did I miss any calls this week?"
+- "Who video-called me yesterday?"
+
+#### `get_bridge_status`
+
+Check the health of the bridge and the local message archive. Reports whether
+the bridge REST API is reachable, whether it is connected to WhatsApp, and
+whether `messages.db` exists and has data — useful for diagnosing failures of
+the other tools.
+
+**Natural Language Examples:**
+
+- "Is my WhatsApp bridge working?"
+- "Why can't you see my messages?"
+
 ## Configuration
 
 Copy `.env.example` to `.env` and configure as needed:
@@ -476,7 +512,8 @@ Caveats:
 ## Call History
 
 The bridge captures incoming WhatsApp voice and video calls live into a
-dedicated `calls` table in `messages.db`. When a 1:1 call arrives
+dedicated `calls` table in `messages.db`. Query it from AI clients with the
+[`list_calls`](#list_calls) tool. When a 1:1 call arrives
 (`CallOffer`) or a group call is announced (`CallOfferNotice`), a row is
 inserted with `result='in_progress'`. Subsequent `CallAccept` /
 `CallReject` / `CallTerminate` events update the row — final result becomes
@@ -563,12 +600,13 @@ flowchart LR
         HEALTH["/api/health"]
     end
 
-    subgraph MCPTools["MCP Tools (14 total)"]
+    subgraph MCPTools["MCP Tools (16 total)"]
         direction TB
         CONT["Contact Tools<br/>search_contacts, get_contact"]
         MSG["Message Tools<br/>list_messages, send_message, etc."]
         CHAT["Chat Tools<br/>list_chats, get_chat, etc."]
         MEDIA["Media Tools<br/>send_file, download_media, etc."]
+        OPS["Call & Status Tools<br/>list_calls, get_bridge_status"]
     end
 
     MCPTools -->|HTTP Requests| GoAPI

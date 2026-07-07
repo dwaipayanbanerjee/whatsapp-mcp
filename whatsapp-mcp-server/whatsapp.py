@@ -1081,6 +1081,152 @@ def _send_payload(payload: dict[str, Any]) -> tuple[bool, str]:
     return result.get("success", False), result.get("message", "Unknown response")
 
 
+def _iso_or_raw(value: str | None) -> str | None:
+    """Normalize a DB timestamp string to ISO-8601, passing through raw values
+    that don't parse rather than dropping them."""
+    if value is None:
+        return None
+    try:
+        return datetime.fromisoformat(value).isoformat()
+    except ValueError:
+        return value
+
+
+def list_calls(
+    after: str | None = None,
+    before: str | None = None,
+    call_type: str | None = None,
+    limit: int = 50,
+    page: int = 0,
+) -> list[dict[str, Any]]:
+    """Get call history captured by the bridge, most recent first.
+
+    Args:
+        after: Optional ISO-8601 string — only calls after this time
+        before: Optional ISO-8601 string — only calls before this time
+        call_type: Optional filter, "voice" or "video"
+        limit: Maximum number of calls to return (default 50)
+        page: Page number for pagination (default 0)
+    """
+    where_clauses = []
+    params: list[Any] = []
+
+    if after:
+        try:
+            params.append(datetime.fromisoformat(after))
+        except ValueError:
+            raise ValueError(f"Invalid date format for 'after': {after}. Please use ISO-8601 format.")
+        where_clauses.append("timestamp > ?")
+
+    if before:
+        try:
+            params.append(datetime.fromisoformat(before))
+        except ValueError:
+            raise ValueError(f"Invalid date format for 'before': {before}. Please use ISO-8601 format.")
+        where_clauses.append("timestamp < ?")
+
+    if call_type:
+        if call_type not in ("voice", "video"):
+            raise ValueError(f"Invalid call_type: {call_type!r}. Use 'voice' or 'video'.")
+        where_clauses.append("call_type = ?")
+        params.append(call_type)
+
+    query = (
+        "SELECT call_id, chat_jid, from_jid, timestamp, is_from_me, call_type, "
+        "is_group, result, duration_sec, ended_at, reason FROM calls"
+    )
+    if where_clauses:
+        query += " WHERE " + " AND ".join(where_clauses)
+    query += " ORDER BY timestamp DESC LIMIT ? OFFSET ?"
+    params.extend([limit, page * limit])
+
+    conn = None
+    try:
+        conn = _connect_messages_db()
+        rows = conn.execute(query, tuple(params)).fetchall()
+    except sqlite3.OperationalError as e:
+        if "no such table: calls" in str(e):
+            raise RuntimeError(
+                "calls table not found in messages.db — restart the whatsapp-bridge (it creates the table at startup)."
+            ) from e
+        raise
+    finally:
+        if conn is not None:
+            conn.close()
+
+    result = []
+    for row in rows:
+        from_jid = row[2] or ""
+        result.append(
+            {
+                "call_id": row[0],
+                "chat_jid": row[1],
+                "from_jid": from_jid,
+                "from_name": get_sender_name(from_jid) if from_jid else None,
+                "timestamp": _iso_or_raw(row[3]),
+                "is_from_me": bool(row[4]),
+                "call_type": row[5],
+                "is_group": bool(row[6]),
+                "result": row[7],
+                "duration_sec": row[8],
+                "ended_at": _iso_or_raw(row[9]),
+                "reason": row[10],
+            }
+        )
+    return result
+
+
+def get_bridge_status() -> dict[str, Any]:
+    """Report bridge reachability, WhatsApp connection state, and archive stats.
+
+    Designed for self-diagnosis: every failure mode maps to a field an agent
+    can act on (bridge down vs. logged out vs. missing/empty database).
+    """
+    status: dict[str, Any] = {
+        "api_url": WHATSAPP_API_BASE_URL,
+        "bridge_reachable": False,
+        "whatsapp_connected": False,
+        "messages_db_path": os.path.abspath(MESSAGES_DB_PATH),
+        "messages_db_exists": os.path.isfile(os.path.abspath(MESSAGES_DB_PATH)),
+    }
+
+    try:
+        response = requests.get(f"{WHATSAPP_API_BASE_URL}/health", headers=_bridge_headers(), timeout=5)
+        if response.status_code in (200, 503):
+            # /api/health returns 200 when connected and 503 with the same
+            # JSON shape while disconnected — both mean the bridge is up.
+            status["bridge_reachable"] = True
+            try:
+                status["whatsapp_connected"] = bool(response.json().get("connected", False))
+            except ValueError:
+                status["bridge_error"] = "health endpoint returned invalid JSON"
+        elif response.status_code == 401:
+            status["bridge_reachable"] = True
+            status["bridge_error"] = (
+                "Unauthorized: bridge token missing or stale — restart the bridge and MCP server, "
+                "or set the same WHATSAPP_BRIDGE_TOKEN in both environments."
+            )
+        else:
+            status["bridge_error"] = f"HTTP {response.status_code} - {response.text}"
+    except requests.RequestException as e:
+        status["bridge_error"] = f"Bridge unreachable: {e}"
+
+    conn = None
+    try:
+        conn = _connect_messages_db()
+        cursor = conn.cursor()
+        status["message_count"] = cursor.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+        status["chat_count"] = cursor.execute("SELECT COUNT(*) FROM chats").fetchone()[0]
+        status["last_message_time"] = _iso_or_raw(cursor.execute("SELECT MAX(timestamp) FROM messages").fetchone()[0])
+    except (sqlite3.Error, OSError) as e:
+        status["db_error"] = str(e)
+    finally:
+        if conn is not None:
+            conn.close()
+
+    return status
+
+
 def send_message(
     recipient: str,
     message: str,
