@@ -125,6 +125,9 @@ class Message:
     filename: str | None = None
     # ID of the message this one is replying to (NULL for non-replies).
     quoted_message_id: str | None = None
+    # Set when the sender used "delete for everyone"; the bridge keeps the
+    # content and stamps the retraction time. Stored as the raw DB string.
+    deleted_at: str | None = None
 
 
 @dataclass
@@ -177,6 +180,13 @@ def msg_to_dict(message: Message, include_sender_name: bool = True) -> dict[str,
                 sender_name = sender_phone
                 sender_display = sender_phone
 
+    deleted_at = message.deleted_at
+    if deleted_at is not None:
+        try:
+            deleted_at = datetime.fromisoformat(deleted_at).isoformat()
+        except ValueError:
+            pass  # surface the raw DB value rather than dropping it
+
     return {
         "id": message.id,
         "timestamp": message.timestamp.isoformat(),
@@ -189,8 +199,11 @@ def msg_to_dict(message: Message, include_sender_name: bool = True) -> dict[str,
         "chat_jid": message.chat_jid,
         "chat_name": message.chat_name,
         "media_type": message.media_type,
+        "media_filename": (message.filename if message.media_type not in (None, "", "reaction") else None),
         "reaction_to_message_id": (message.filename if message.media_type == "reaction" else None),
         "quoted_message_id": message.quoted_message_id,
+        "is_deleted": message.deleted_at is not None,
+        "deleted_at": deleted_at,
     }
 
 
@@ -448,7 +461,7 @@ def list_messages(
 
         # Build base query
         query_parts = [
-            "SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type, messages.quoted_message_id, messages.filename FROM messages"
+            "SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type, messages.quoted_message_id, messages.filename, messages.deleted_at FROM messages"
         ]
         query_parts.append("JOIN chats ON messages.chat_jid = chats.jid")
         where_clauses = []
@@ -515,6 +528,7 @@ def list_messages(
                 media_type=msg[7],
                 quoted_message_id=msg[8] if len(msg) > 8 else None,
                 filename=msg[9] if len(msg) > 9 else None,
+                deleted_at=msg[10] if len(msg) > 10 else None,
             )
             result.append(message)
 
@@ -558,7 +572,7 @@ def get_message_context(message_id: str, before: int = 5, after: int = 5) -> Mes
         # Get the target message first
         cursor.execute(
             """
-            SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.chat_jid, messages.media_type, messages.quoted_message_id, messages.filename
+            SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.chat_jid, messages.media_type, messages.quoted_message_id, messages.filename, messages.deleted_at
             FROM messages
             JOIN chats ON messages.chat_jid = chats.jid
             WHERE messages.id = ?
@@ -581,12 +595,13 @@ def get_message_context(message_id: str, before: int = 5, after: int = 5) -> Mes
             media_type=msg_data[8],
             quoted_message_id=msg_data[9] if len(msg_data) > 9 else None,
             filename=msg_data[10] if len(msg_data) > 10 else None,
+            deleted_at=msg_data[11] if len(msg_data) > 11 else None,
         )
 
         # Get messages before
         cursor.execute(
             """
-            SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type, messages.quoted_message_id, messages.filename
+            SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type, messages.quoted_message_id, messages.filename, messages.deleted_at
             FROM messages
             JOIN chats ON messages.chat_jid = chats.jid
             WHERE messages.chat_jid = ? AND messages.timestamp < ?
@@ -610,13 +625,14 @@ def get_message_context(message_id: str, before: int = 5, after: int = 5) -> Mes
                     media_type=msg[7],
                     quoted_message_id=msg[8] if len(msg) > 8 else None,
                     filename=msg[9] if len(msg) > 9 else None,
+                    deleted_at=msg[10] if len(msg) > 10 else None,
                 )
             )
 
         # Get messages after
         cursor.execute(
             """
-            SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type, messages.quoted_message_id, messages.filename
+            SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type, messages.quoted_message_id, messages.filename, messages.deleted_at
             FROM messages
             JOIN chats ON messages.chat_jid = chats.jid
             WHERE messages.chat_jid = ? AND messages.timestamp > ?
@@ -640,6 +656,7 @@ def get_message_context(message_id: str, before: int = 5, after: int = 5) -> Mes
                     media_type=msg[7],
                     quoted_message_id=msg[8] if len(msg) > 8 else None,
                     filename=msg[9] if len(msg) > 9 else None,
+                    deleted_at=msg[10] if len(msg) > 10 else None,
                 )
             )
 
@@ -908,7 +925,10 @@ def get_last_interaction(jid: str) -> dict[str, Any] | None:
                 m.is_from_me,
                 c.jid,
                 m.id,
-                m.media_type
+                m.media_type,
+                m.quoted_message_id,
+                m.filename,
+                m.deleted_at
             FROM messages m
             JOIN chats c ON m.chat_jid = c.jid
             WHERE m.sender IN ({placeholders}) OR c.jid = ?
@@ -932,6 +952,9 @@ def get_last_interaction(jid: str) -> dict[str, Any] | None:
             chat_jid=msg_data[5],
             id=msg_data[6],
             media_type=msg_data[7],
+            quoted_message_id=msg_data[8] if len(msg_data) > 8 else None,
+            filename=msg_data[9] if len(msg_data) > 9 else None,
+            deleted_at=msg_data[10] if len(msg_data) > 10 else None,
         )
 
         return msg_to_dict(message)
