@@ -2887,15 +2887,14 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					continue
 				}
 
-				// Extract text content
-				var content string
-				if msg.Message.Message != nil {
-					if conv := msg.Message.Message.GetConversation(); conv != "" {
-						content = conv
-					} else if ext := msg.Message.Message.GetExtendedTextMessage(); ext != nil {
-						content = ext.GetText()
-					}
-				}
+				// Extract text content through the same extractor as live
+				// messages so history-synced media captions, templates, and
+				// button texts are not silently dropped.
+				content := extractTextContent(msg.Message.Message)
+
+				// Quoted-reply context arrives in history sync the same way
+				// as on live messages (ContextInfo on the sub-message).
+				quotedMessageId, _, _ := extractQuotedMessageInfo(msg.Message.Message)
 
 				// Extract media info - pass message timestamp + ID for unique filenames
 				var mediaType, filename, url string
@@ -2910,9 +2909,6 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 				if msg.Message.Message != nil {
 					mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength = extractMediaInfo(msg.Message.Message, timestamp, histMsgID)
 				}
-
-				// Log the message content for debugging
-				logger.Infof("Message content: %v, Media Type: %v", content, mediaType)
 
 				// Skip messages with no content and no media
 				if content == "" && mediaType == "" {
@@ -2977,20 +2973,16 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					fileSHA256,
 					fileEncSHA256,
 					fileLength,
-					"", // quoted_message_id: history sync does not carry ContextInfo
+					quotedMessageId,
 				)
 				if err != nil {
 					logger.Warnf("Failed to store history message: %v", err)
 				} else {
+					// Deliberately no per-message log here: a full-history sync
+					// stores tens of thousands of messages, and logging each one
+					// both drowns the log and writes private message content to
+					// disk. The per-chunk summary below is enough to follow along.
 					syncedCount++
-					// Log successful message storage
-					if mediaType != "" {
-						logger.Infof("Stored message: [%s] %s -> %s: [%s: %s] %s",
-							msgTimestamp.Format("2006-01-02 15:04:05"), sender, chatJID, mediaType, filename, content)
-					} else {
-						logger.Infof("Stored message: [%s] %s -> %s: %s",
-							msgTimestamp.Format("2006-01-02 15:04:05"), sender, chatJID, content)
-					}
 				}
 			}
 		}

@@ -1010,6 +1010,86 @@ func TestHandleHistorySync_LIDParticipant_ResolvedViaStore(t *testing.T) {
 	}
 }
 
+// TestHandleHistorySync_MediaCaptionAndQuotedReplyStored guards the
+// history-sync path against regressing to a bare Conversation/ExtendedText
+// extractor: media captions must land in content, and quoted-reply IDs must
+// be persisted just like they are for live messages.
+func TestHandleHistorySync_MediaCaptionAndQuotedReplyStored(t *testing.T) {
+	chatJID := phonePN.String()
+	client := newTestClientWithSelf(&mockLIDStore{}, selfPhone)
+	ms := newTestMessageStore(t)
+	logger := testLogger()
+
+	historySync := &events.HistorySync{
+		Data: &waProto.HistorySync{
+			SyncType: waProto.HistorySync_RECENT.Enum(),
+			Conversations: []*waProto.Conversation{
+				{
+					ID: proto.String(chatJID),
+					Messages: []*waProto.HistorySyncMsg{
+						{
+							Message: &waProto.WebMessageInfo{
+								Key: &waCommon.MessageKey{
+									ID:     proto.String("hist-img-001"),
+									FromMe: proto.Bool(false),
+								},
+								MessageTimestamp: proto.Uint64(uint64(time.Now().Unix())),
+								Message: &waProto.Message{
+									ImageMessage: &waProto.ImageMessage{
+										Caption: proto.String("look at this"),
+									},
+								},
+							},
+						},
+						{
+							Message: &waProto.WebMessageInfo{
+								Key: &waCommon.MessageKey{
+									ID:     proto.String("hist-reply-001"),
+									FromMe: proto.Bool(false),
+								},
+								MessageTimestamp: proto.Uint64(uint64(time.Now().Unix())),
+								Message: &waProto.Message{
+									ExtendedTextMessage: &waProto.ExtendedTextMessage{
+										Text: proto.String("replying"),
+										ContextInfo: &waProto.ContextInfo{
+											StanzaID:      proto.String("hist-img-001"),
+											Participant:   proto.String(chatJID),
+											QuotedMessage: &waProto.Message{Conversation: proto.String("look at this")},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	handleHistorySync(client, ms, historySync, logger)
+
+	var content, mediaType string
+	if err := ms.db.QueryRow(
+		"SELECT content, media_type FROM messages WHERE id = 'hist-img-001'").Scan(&content, &mediaType); err != nil {
+		t.Fatalf("history-sync image message not stored: %v", err)
+	}
+	if content != "look at this" {
+		t.Errorf("history-sync image caption = %q, want %q", content, "look at this")
+	}
+	if mediaType != "image" {
+		t.Errorf("history-sync media_type = %q, want %q", mediaType, "image")
+	}
+
+	var quoted sql.NullString
+	if err := ms.db.QueryRow(
+		"SELECT quoted_message_id FROM messages WHERE id = 'hist-reply-001'").Scan(&quoted); err != nil {
+		t.Fatalf("history-sync reply message not stored: %v", err)
+	}
+	if !quoted.Valid || quoted.String != "hist-img-001" {
+		t.Errorf("history-sync quoted_message_id = %+v, want %q", quoted, "hist-img-001")
+	}
+}
+
 func TestMigrateLegacyLIDChatsToPhoneJIDs_MigratesAndIsIdempotent(t *testing.T) {
 	ms := newTestMessageStore(t)
 	logger := testLogger()
