@@ -2,8 +2,10 @@ import logging
 import os
 import os.path
 import sqlite3
+import time
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 import requests
@@ -28,6 +30,36 @@ WHATSMEOW_DB_PATH = os.getenv(
 WHATSAPP_API_BASE_URL = os.getenv("WHATSAPP_API_URL", "http://localhost:8080/api")
 
 _BRIDGE_TOKEN_PATH = os.path.join(os.path.dirname(WHATSMEOW_DB_PATH), ".bridge-token")
+
+
+def _connect_messages_db() -> sqlite3.Connection:
+    """Open messages.db read-only.
+
+    Read-only matters twice over: a plain sqlite3.connect() silently creates
+    an empty database file when the path is wrong (turning a config mistake
+    into a confusing "no such table: messages" error later), and the MCP
+    server must never take write locks against the bridge, which owns this
+    database.
+    """
+    path = os.path.abspath(MESSAGES_DB_PATH)
+    if not os.path.isfile(path):
+        raise FileNotFoundError(
+            f"messages.db not found at {path}. Start the whatsapp-bridge at least once "
+            "(it creates the database), or point WHATSAPP_DB_PATH at the correct file."
+        )
+    return sqlite3.connect(f"{Path(path).as_uri()}?mode=ro", uri=True)
+
+
+def _connect_whatsmeow_db() -> sqlite3.Connection | None:
+    """Open whatsmeow's whatsapp.db read-only, or None if it doesn't exist.
+
+    A missing whatsmeow DB is expected before first pairing, so callers
+    treat None as "no LID/contact data available" rather than an error.
+    """
+    path = os.path.abspath(WHATSMEOW_DB_PATH)
+    if not os.path.isfile(path):
+        return None
+    return sqlite3.connect(f"{Path(path).as_uri()}?mode=ro", uri=True)
 
 
 def _read_bridge_token() -> str | None:
@@ -188,9 +220,9 @@ def _sender_aliases(value: str) -> list[str]:
     bare = value.split("@", 1)[0]
     pn: str | None = None
     lid: str | None = None
-    if os.path.isfile(WHATSMEOW_DB_PATH):
-        try:
-            conn = sqlite3.connect(WHATSMEOW_DB_PATH)
+    try:
+        conn = _connect_whatsmeow_db()
+        if conn is not None:
             try:
                 row = conn.execute("SELECT lid FROM whatsmeow_lid_map WHERE pn = ?", (bare,)).fetchone()
                 if row:
@@ -201,8 +233,8 @@ def _sender_aliases(value: str) -> list[str]:
                         lid, pn = bare, row[0]
             finally:
                 conn.close()
-        except sqlite3.Error:
-            pass
+    except sqlite3.Error:
+        pass
 
     aliases: list[str] = []
     if pn:
@@ -225,12 +257,13 @@ def _resolve_lid_to_phone(lid_or_jid: str) -> str | None:
 
     Returns the phone number if found, None otherwise.
     """
-    if not os.path.exists(WHATSMEOW_DB_PATH):
-        return None
     # Extract the numeric part from JID-style strings (e.g. '35047067385985@lid')
     lid = lid_or_jid.split("@")[0] if "@" in lid_or_jid else lid_or_jid
+    conn = None
     try:
-        conn = sqlite3.connect(WHATSMEOW_DB_PATH)
+        conn = _connect_whatsmeow_db()
+        if conn is None:
+            return None
         cursor = conn.cursor()
         cursor.execute("SELECT pn FROM whatsmeow_lid_map WHERE lid = ? LIMIT 1", (lid,))
         row = cursor.fetchone()
@@ -238,7 +271,7 @@ def _resolve_lid_to_phone(lid_or_jid: str) -> str | None:
     except sqlite3.Error:
         return None
     finally:
-        if "conn" in locals():
+        if conn is not None:
             conn.close()
 
 
@@ -251,9 +284,6 @@ def _resolve_name_from_whatsmeow(jid: str) -> str | None:
 
     Falls back gracefully if the DB or table doesn't exist.
     """
-    if not os.path.exists(WHATSMEOW_DB_PATH):
-        return None
-
     lookup_jid = jid
     jid_prefix = jid.split("@")[0] if "@" in jid else jid
     jid_suffix = jid.split("@")[1] if "@" in jid else ""
@@ -269,8 +299,11 @@ def _resolve_name_from_whatsmeow(jid: str) -> str | None:
             # Definitely a LID but not in the map — can't resolve
             return None
 
+    conn = None
     try:
-        conn = sqlite3.connect(WHATSMEOW_DB_PATH)
+        conn = _connect_whatsmeow_db()
+        if conn is None:
+            return None
         cursor = conn.cursor()
         # whatsmeow_contacts columns: our_jid, their_jid, first_name, full_name, push_name, business_name
         cursor.execute(
@@ -285,13 +318,37 @@ def _resolve_name_from_whatsmeow(jid: str) -> str | None:
     except sqlite3.Error:
         return None
     finally:
-        if "conn" in locals():
+        if conn is not None:
             conn.close()
 
 
+# get_sender_name runs for every message returned by list_messages (often
+# multiplied by per-message context expansion), and each miss costs LIKE
+# scans across two databases. Names change rarely, so a short TTL cache
+# removes almost all of that cost without meaningful staleness.
+_SENDER_NAME_TTL_SECONDS = 300
+_SENDER_NAME_CACHE_MAX = 4096
+_sender_name_cache: dict[str, tuple[float, str]] = {}
+
+
 def get_sender_name(sender_jid: str) -> str:
+    now = time.monotonic()
+    cached = _sender_name_cache.get(sender_jid)
+    if cached and now - cached[0] < _SENDER_NAME_TTL_SECONDS:
+        return cached[1]
+
+    name = _lookup_sender_name(sender_jid)
+
+    if len(_sender_name_cache) >= _SENDER_NAME_CACHE_MAX:
+        _sender_name_cache.clear()
+    _sender_name_cache[sender_jid] = (now, name)
+    return name
+
+
+def _lookup_sender_name(sender_jid: str) -> str:
+    conn = None
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = _connect_messages_db()
         cursor = conn.cursor()
 
         # First try matching by exact JID
@@ -343,11 +400,13 @@ def get_sender_name(sender_jid: str) -> str:
 
         return sender_jid
 
-    except sqlite3.Error as e:
+    except (sqlite3.Error, OSError) as e:
+        # Name resolution is best-effort decoration; a missing or broken DB
+        # must not fail the read that triggered it.
         logger.warning("Database error while getting sender name: %s", e)
         return sender_jid
     finally:
-        if "conn" in locals():
+        if conn is not None:
             conn.close()
 
 
@@ -383,7 +442,7 @@ def list_messages(
         List of message dictionaries with id, timestamp, sender, content, etc.
     """
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = _connect_messages_db()
         cursor = conn.cursor()
 
         # Build base query
@@ -492,7 +551,7 @@ def list_messages(
 def get_message_context(message_id: str, before: int = 5, after: int = 5) -> MessageContext:
     """Get context around a specific message."""
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = _connect_messages_db()
         cursor = conn.cursor()
 
         # Get the target message first
@@ -606,7 +665,7 @@ def list_chats(
         List of chat dictionaries with jid, name, is_group, last_message, etc.
     """
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = _connect_messages_db()
         cursor = conn.cursor()
 
         # Build base query. The last-message columns are referenced by tuple
@@ -701,7 +760,7 @@ def search_contacts(query: str) -> list[dict[str, Any]]:
 
     # 1) Search messages.db chats table (existing behavior)
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = _connect_messages_db()
         cursor = conn.cursor()
         cursor.execute(
             """
@@ -727,9 +786,10 @@ def search_contacts(query: str) -> list[dict[str, Any]]:
             conn.close()
 
     # 2) Search whatsmeow contact store (whatsapp.db)
-    if os.path.exists(WHATSMEOW_DB_PATH):
-        try:
-            conn2 = sqlite3.connect(WHATSMEOW_DB_PATH)
+    conn2 = None
+    try:
+        conn2 = _connect_whatsmeow_db()
+        if conn2 is not None:
             cursor2 = conn2.cursor()
             cursor2.execute(
                 """
@@ -751,11 +811,11 @@ def search_contacts(query: str) -> list[dict[str, Any]]:
                     name = full_name or push_name or first_name or business_name or ""
                     contact = Contact(phone_number=their_jid.split("@")[0], name=name, jid=their_jid)
                     result.append(contact_to_dict(contact))
-        except sqlite3.Error as e:
-            logger.warning("Database error (whatsapp.db): %s", e)
-        finally:
-            if "conn2" in locals():
-                conn2.close()
+    except sqlite3.Error as e:
+        logger.warning("Database error (whatsapp.db): %s", e)
+    finally:
+        if conn2 is not None:
+            conn2.close()
 
     return result
 
@@ -769,7 +829,7 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> list[dict[str
         page: Page number for pagination (default 0)
     """
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = _connect_messages_db()
         cursor = conn.cursor()
 
         aliases = _sender_aliases(jid)
@@ -832,7 +892,7 @@ def get_last_interaction(jid: str) -> dict[str, Any] | None:
         Message dictionary or None if no messages found
     """
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = _connect_messages_db()
         cursor = conn.cursor()
 
         aliases = _sender_aliases(jid)
@@ -890,7 +950,7 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> dict[str, Any]
         Chat dictionary or None if not found
     """
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = _connect_messages_db()
         cursor = conn.cursor()
 
         # See list_chats: keep result tuple shape stable across the
@@ -945,7 +1005,7 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> dict[str, Any]
 def get_direct_chat_by_contact(sender_phone_number: str) -> dict[str, Any] | None:
     """Get chat metadata by sender phone number."""
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = _connect_messages_db()
         cursor = conn.cursor()
 
         cursor.execute(
