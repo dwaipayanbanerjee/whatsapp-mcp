@@ -48,6 +48,23 @@ var fullHistoryPairFlag = flag.Bool("full-history-pair", false,
 
 const whatsmeowDBPath = "store/whatsapp.db"
 
+// resolveLogLevel reads WHATSAPP_LOG_LEVEL and maps it to a whatsmeow log
+// level. Defaults to INFO; DEBUG logs every stanza and is only useful when
+// actively debugging protocol issues. Unrecognized values fall back to INFO
+// with a warning rather than aborting startup.
+func resolveLogLevel() string {
+	v := strings.ToUpper(strings.TrimSpace(os.Getenv("WHATSAPP_LOG_LEVEL")))
+	switch v {
+	case "":
+		return "INFO"
+	case "DEBUG", "INFO", "WARN", "ERROR":
+		return v
+	default:
+		fmt.Printf("Warning: invalid WHATSAPP_LOG_LEVEL=%q, using INFO (accepted: DEBUG, INFO, WARN, ERROR)\n", v)
+		return "INFO"
+	}
+}
+
 // getEnvBool reads a boolean env var with a default.
 // Accepts: 1/true/yes/on and 0/false/no/off (case-insensitive)
 func getEnvBool(key string, def bool) bool {
@@ -2260,8 +2277,9 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 func main() {
 	flag.Parse()
 
-	// Set up logger with DEBUG level for more detailed logging
-	logger := waLog.Stdout("Client", "DEBUG", true)
+	// Log level defaults to INFO; set WHATSAPP_LOG_LEVEL=DEBUG for
+	// per-stanza protocol logging when debugging.
+	logger := waLog.Stdout("Client", resolveLogLevel(), true)
 	logger.Infof("Starting WhatsApp client...")
 
 	if forwardSelfMessages {

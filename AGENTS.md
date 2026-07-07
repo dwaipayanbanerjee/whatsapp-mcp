@@ -107,6 +107,7 @@ A failing blocking job is a hard block — fix it or explain in the PR why it's 
 | `WHATSAPP_MCP_PORT` | `8000` | Port for the `http`/`sse` transports |
 | `WEBHOOK_URL` | `http://localhost:8769/whatsapp/webhook` | Outgoing webhook for incoming messages (empty = disabled) |
 | `FORWARD_SELF` | `true` | Whether self-sent messages are forwarded (`getEnvBool` default; set `FORWARD_SELF=false` to disable) |
+| `WHATSAPP_LOG_LEVEL` | `INFO` | Bridge log verbosity: `DEBUG`, `INFO`, `WARN`, or `ERROR` |
 
 When adding a new env var: document it here, in `README.md`, and in `.env.example`.
 

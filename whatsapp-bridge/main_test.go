@@ -1090,6 +1090,23 @@ func TestHandleHistorySync_MediaCaptionAndQuotedReplyStored(t *testing.T) {
 	}
 }
 
+func TestResolveLogLevel(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"", "INFO"},
+		{"debug", "DEBUG"},
+		{"Info", "INFO"},
+		{"WARN", "WARN"},
+		{"error", "ERROR"},
+		{"nonsense", "INFO"},
+	}
+	for _, c := range cases {
+		t.Setenv("WHATSAPP_LOG_LEVEL", c.in)
+		if got := resolveLogLevel(); got != c.want {
+			t.Errorf("resolveLogLevel(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
 func TestMigrateLegacyLIDChatsToPhoneJIDs_MigratesAndIsIdempotent(t *testing.T) {
 	ms := newTestMessageStore(t)
 	logger := testLogger()
