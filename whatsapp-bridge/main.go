@@ -48,6 +48,50 @@ var fullHistoryPairFlag = flag.Bool("full-history-pair", false,
 
 const whatsmeowDBPath = "store/whatsapp.db"
 
+// currentQRPath holds the QR code that is valid *right now* during pairing.
+// The REST server does not start until after pairing succeeds, so an HTTP
+// endpoint would be unreachable exactly when the QR is needed. A file drop
+// works in every state, and is rewritten on each ~20s rotation.
+const currentQRPath = "store/qr-current.json"
+
+type currentQR struct {
+	Code      string `json:"code"`
+	EmittedAt int64  `json:"emitted_at"`
+	ExpiresAt int64  `json:"expires_at"`
+	Rotation  int    `json:"rotation"`
+}
+
+// writeCurrentQR atomically publishes the live pairing code.
+func writeCurrentQR(code string, ttl time.Duration, rotation int, logger waLog.Logger) {
+	now := time.Now()
+	payload := currentQR{
+		Code:      code,
+		EmittedAt: now.Unix(),
+		ExpiresAt: now.Add(ttl).Unix(),
+		Rotation:  rotation,
+	}
+	blob, err := json.Marshal(payload)
+	if err != nil {
+		logger.Warnf("could not marshal QR payload: %v", err)
+		return
+	}
+	tmp := currentQRPath + ".tmp"
+	if err := os.WriteFile(tmp, blob, 0600); err != nil {
+		logger.Warnf("could not write QR file: %v", err)
+		return
+	}
+	if err := os.Rename(tmp, currentQRPath); err != nil {
+		logger.Warnf("could not publish QR file: %v", err)
+	}
+}
+
+// clearCurrentQR removes the pairing code once it is scanned or expires, so a
+// stale code is never presented as live.
+func clearCurrentQR() {
+	_ = os.Remove(currentQRPath)
+	_ = os.Remove(currentQRPath + ".tmp")
+}
+
 // resolveLogLevel reads WHATSAPP_LOG_LEVEL and maps it to a whatsmeow log
 // level. Defaults to INFO; DEBUG logs every stanza and is only useful when
 // actively debugging protocol issues. Unrecognized values fall back to INFO
@@ -1860,6 +1904,12 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 
 	// Download the media using whatsmeow client
 	mediaData, err := client.Download(context.Background(), downloader)
+	if err != nil && isExpiredMediaErr(err) {
+		// CDN copy is gone (WhatsApp expires media server-side). Fall back to
+		// the official client's recovery path: ask the sender's phone to
+		// re-upload, then fetch from the fresh direct path. See mediaretry.go.
+		mediaData, err = recoverViaMediaRetry(client, messageStore, messageID, chatJID, downloader)
+	}
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -1909,12 +1959,24 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 	// Health check endpoint
 	mux.HandleFunc("/api/health", auth(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		// "connected" is transport-level only. A bridge whose device was
+		// removed stays connected=false but also logged_in=false, and a
+		// bridge that is merely mid-reconnect is logged_in=true. Report both
+		// so callers can tell "retry later" from "human must rescan a QR".
+		loggedIn := client.IsLoggedIn()
+		paired := client.Store != nil && client.Store.ID != nil
 		status := map[string]interface{}{
 			"status":    "ok",
 			"connected": client.IsConnected(),
+			"logged_in": loggedIn,
+			"paired":    paired,
 			"timestamp": time.Now().Unix(),
 		}
-		if !client.IsConnected() {
+		if !paired {
+			status["status"] = "unpaired"
+			status["hint"] = "no device session; restart bridge and scan the QR in " + currentQRPath
+			w.WriteHeader(http.StatusServiceUnavailable)
+		} else if !client.IsConnected() || !loggedIn {
 			status["status"] = "disconnected"
 			w.WriteHeader(http.StatusServiceUnavailable)
 		}
@@ -2314,6 +2376,11 @@ func main() {
 			// Process history sync events
 			handleHistorySync(client, messageStore, v, logger)
 
+		case *events.MediaRetry:
+			// Response to a SendMediaRetryReceipt issued by downloadMedia's
+			// expired-media recovery (see mediaretry.go).
+			deliverMediaRetry(v)
+
 		case *events.GroupInfo:
 			if v.Ephemeral != nil {
 				expiration := uint32(0)
@@ -2451,8 +2518,15 @@ func main() {
 
 			// Print QR code for pairing with phone
 			qrCodeShown := false
+			rotation := 0
+			clearCurrentQR()
 			for evt := range qrChan {
 				if evt.Event == "code" {
+					// Publish every rotation, not just the first: the code
+					// changes roughly every 20s and only the newest one scans.
+					rotation++
+					writeCurrentQR(evt.Code, evt.Timeout, rotation, logger)
+					logger.Infof("QR rotation %d published to %s (valid %s)", rotation, currentQRPath, evt.Timeout)
 					if !qrCodeShown {
 						fmt.Println("\nScan this QR code with your WhatsApp app:")
 						qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
@@ -2460,13 +2534,16 @@ func main() {
 						qrCodeShown = true
 					}
 				} else if evt.Event == "success" {
+					clearCurrentQR()
 					connected <- true
 					break
 				} else if evt.Event == "timeout" {
+					clearCurrentQR()
 					logger.Warnf("QR code timed out")
 					break
 				}
 			}
+			clearCurrentQR()
 
 			// Wait for connection with timeout
 			select {
