@@ -7,6 +7,10 @@
 # Config
 claude_desktop_config.json
 
+# Local pairing helpers and generated QR artifacts
+/pair.command
+/pairing/
+
 # Claude Code local settings (per-user)
 .claude/settings.local.json
 

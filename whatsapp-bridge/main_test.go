@@ -2521,3 +2521,67 @@ func TestNewMessageStoreCreatesMessagesChatJIDIndex(t *testing.T) {
 		t.Fatalf("expected idx_messages_chat_jid to exist, found %d", count)
 	}
 }
+
+func TestHistorySyncMessageInfoValidatesAndBuildsAnchor(t *testing.T) {
+	req := historySyncRequest{
+		ChatJID:   "15551234567@s.whatsapp.net",
+		MessageID: "3AANCHOR",
+		Timestamp: "2026-07-24T11:00:00Z",
+		IsFromMe:  true,
+		Count:     500,
+	}
+	info, count, err := historySyncMessageInfo(req)
+	if err != nil {
+		t.Fatalf("historySyncMessageInfo() failed: %v", err)
+	}
+	if info.Chat.String() != req.ChatJID || info.ID != req.MessageID || !info.IsFromMe {
+		t.Fatalf("unexpected message info: %+v", info)
+	}
+	if !info.Timestamp.Equal(time.Date(2026, 7, 24, 11, 0, 0, 0, time.UTC)) {
+		t.Fatalf("unexpected timestamp: %s", info.Timestamp)
+	}
+	if count != 500 {
+		t.Fatalf("count = %d, want 500", count)
+	}
+
+	for _, bad := range []historySyncRequest{
+		{},
+		{ChatJID: "not-a-jid", MessageID: "x", Timestamp: req.Timestamp, Count: 50},
+		{ChatJID: req.ChatJID, MessageID: "", Timestamp: req.Timestamp, Count: 50},
+		{ChatJID: req.ChatJID, MessageID: "x", Timestamp: "bad", Count: 50},
+		{ChatJID: req.ChatJID, MessageID: "x", Timestamp: req.Timestamp, Count: 0},
+		{ChatJID: req.ChatJID, MessageID: "x", Timestamp: req.Timestamp, Count: 1001},
+	} {
+		if _, _, err := historySyncMessageInfo(bad); err == nil {
+			t.Fatalf("expected validation error for %+v", bad)
+		}
+	}
+}
+
+func TestOnDemandHistoryCompletionIsObservable(t *testing.T) {
+	markOnDemandHistoryComplete(123456789, 37)
+	completedAt, storedCount := onDemandHistoryStatus()
+	if completedAt != 123456789 || storedCount != 37 {
+		t.Fatalf("unexpected completion status: completed=%d stored=%d", completedAt, storedCount)
+	}
+}
+
+func TestHistoryMediaDownloadEligibleRequiresRecoverableMediaMetadata(t *testing.T) {
+	complete := historyMediaDownload{
+		MessageID:     "media-1",
+		ChatJID:       "15551234567@s.whatsapp.net",
+		MediaType:     "image",
+		URL:           "https://mmg.whatsapp.net/media",
+		MediaKey:      []byte{1},
+		FileSHA256:    []byte{2},
+		FileEncSHA256: []byte{3},
+		FileLength:    42,
+	}
+	if !complete.eligible() {
+		t.Fatal("complete media metadata should be queued for durable download")
+	}
+	complete.URL = ""
+	if complete.eligible() {
+		t.Fatal("media without a URL must not be queued")
+	}
+}

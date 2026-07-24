@@ -1955,6 +1955,7 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 		return withAuth(token, allowedHosts, h)
 	}
 	mux := http.NewServeMux()
+	registerHistorySyncHandler(mux, client, auth)
 
 	// Health check endpoint
 	mux.HandleFunc("/api/health", auth(func(w http.ResponseWriter, r *http.Request) {
@@ -2850,6 +2851,47 @@ func handleCallOffer(client *whatsmeow.Client, messageStore *MessageStore, meta 
 		kind, direction, meta.CallID, callType, fromJID, chatJID)
 }
 
+type historyMediaDownload struct {
+	MessageID     string
+	ChatJID       string
+	MediaType     string
+	URL           string
+	MediaKey      []byte
+	FileSHA256    []byte
+	FileEncSHA256 []byte
+	FileLength    uint64
+}
+
+func (task historyMediaDownload) eligible() bool {
+	return task.MessageID != "" &&
+		task.ChatJID != "" &&
+		task.MediaType != "" &&
+		task.URL != "" &&
+		len(task.MediaKey) > 0 &&
+		len(task.FileSHA256) > 0 &&
+		len(task.FileEncSHA256) > 0 &&
+		task.FileLength > 0
+}
+
+func queueHistoryMediaDownloads(
+	client *whatsmeow.Client,
+	messageStore *MessageStore,
+	tasks []historyMediaDownload,
+	logger waLog.Logger,
+) {
+	if len(tasks) == 0 {
+		return
+	}
+	go func() {
+		for _, task := range tasks {
+			success, _, _, _, err := downloadMedia(client, messageStore, task.MessageID, task.ChatJID)
+			if !success || err != nil {
+				logger.Warnf("History media capture failed for message %s in %s: %v", task.MessageID, task.ChatJID, err)
+			}
+		}
+	}()
+}
+
 func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, historySync *events.HistorySync, logger waLog.Logger) {
 	// Log every history sync event with its shape. Different sync types
 	// carry different payloads; logging type/chunk/progress makes it easy
@@ -2862,6 +2904,7 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 	)
 
 	syncedCount := 0
+	mediaDownloads := make([]historyMediaDownload, 0)
 	for _, conversation := range historySync.Data.Conversations {
 		// Parse JID from the conversation
 		if conversation.ID == nil {
@@ -3008,6 +3051,19 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 				if err != nil {
 					logger.Warnf("Failed to store history message: %v", err)
 				} else {
+					task := historyMediaDownload{
+						MessageID:     msgID,
+						ChatJID:       chatJID,
+						MediaType:     mediaType,
+						URL:           url,
+						MediaKey:      mediaKey,
+						FileSHA256:    fileSHA256,
+						FileEncSHA256: fileEncSHA256,
+						FileLength:    fileLength,
+					}
+					if task.eligible() {
+						mediaDownloads = append(mediaDownloads, task)
+					}
 					// Deliberately no per-message log here: a full-history sync
 					// stores tens of thousands of messages, and logging each one
 					// both drowns the log and writes private message content to
@@ -3018,6 +3074,10 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 		}
 	}
 
+	queueHistoryMediaDownloads(client, messageStore, mediaDownloads, logger)
+	if historySync.Data.GetSyncType() == waProto.HistorySync_ON_DEMAND {
+		markOnDemandHistoryComplete(time.Now().UnixMilli(), syncedCount)
+	}
 	fmt.Printf("History sync complete. Stored %d messages.\n", syncedCount)
 }
 
