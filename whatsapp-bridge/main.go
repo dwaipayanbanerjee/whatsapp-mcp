@@ -2280,6 +2280,12 @@ func main() {
 	logger := waLog.Stdout("Client", resolveLogLevel(), true)
 	logger.Infof("Starting WhatsApp client...")
 
+	if os.Getenv("WEBHOOK_URL") == "" {
+		logger.Infof("Webhook disabled: WEBHOOK_URL is not set")
+	} else {
+		logger.Infof("Webhook enabled: %s", os.Getenv("WEBHOOK_URL"))
+	}
+
 	if forwardSelfMessages {
 		logger.Infof("FORWARD_SELF enabled: forwarding self messages to webhook")
 	} else {

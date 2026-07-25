@@ -42,11 +42,15 @@ type WebhookPayload struct {
 	ReactionRemoved     *bool   `json:"reactionRemoved,omitempty"`
 }
 
-// sendWebhookPayload marshals and POSTs a WebhookPayload to the configured webhook URL.
+// sendWebhookPayload marshals and POSTs a WebhookPayload to WEBHOOK_URL.
+// The webhook is OPT-IN: when WEBHOOK_URL is unset or empty, no HTTP request
+// is made. (There is deliberately no default endpoint — an unconfigured
+// webhook used to dial localhost:8769 on every message and log a connection
+// error each time.)
 func sendWebhookPayload(payload WebhookPayload) {
 	webhookURL := os.Getenv("WEBHOOK_URL")
 	if webhookURL == "" {
-		webhookURL = "http://localhost:8769/whatsapp/webhook"
+		return
 	}
 
 	jsonData, err := json.Marshal(payload)
