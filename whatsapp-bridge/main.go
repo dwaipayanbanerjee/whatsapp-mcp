@@ -2286,6 +2286,22 @@ func main() {
 		logger.Infof("Webhook enabled: %s", os.Getenv("WEBHOOK_URL"))
 	}
 
+	// launchd redirects stdout/stderr to bridge.log (relative to the plist's
+	// WorkingDirectory, this directory) and never rotates it; rotate in-process.
+	logMaxMB := int64(50)
+	if v := strings.TrimSpace(os.Getenv("WHATSAPP_LOG_MAX_MB")); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n >= 0 {
+			logMaxMB = n
+		} else {
+			logger.Warnf("Invalid WHATSAPP_LOG_MAX_MB=%q, using default 50", v)
+		}
+	}
+	if logMaxMB > 0 {
+		startLogRotation("bridge.log", logMaxMB*1024*1024, time.Hour, logger)
+	} else {
+		logger.Infof("Log rotation disabled (WHATSAPP_LOG_MAX_MB=0)")
+	}
+
 	if forwardSelfMessages {
 		logger.Infof("FORWARD_SELF enabled: forwarding self messages to webhook")
 	} else {
