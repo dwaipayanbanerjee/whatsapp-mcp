@@ -2560,9 +2560,9 @@ func TestHistorySyncMessageInfoValidatesAndBuildsAnchor(t *testing.T) {
 
 func TestOnDemandHistoryCompletionIsObservable(t *testing.T) {
 	markOnDemandHistoryComplete(123456789, 37)
-	completedAt, storedCount := onDemandHistoryStatus()
-	if completedAt != 123456789 || storedCount != 37 {
-		t.Fatalf("unexpected completion status: completed=%d stored=%d", completedAt, storedCount)
+	last, _ := onDemandHistory.snapshot(123456790)
+	if last.CompletedAtMs != 123456789 || last.StoredCount != 37 {
+		t.Fatalf("unexpected completion status: %+v", last)
 	}
 }
 
