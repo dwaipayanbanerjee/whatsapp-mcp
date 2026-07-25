@@ -159,10 +159,14 @@ func registerHistorySyncHandler(
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		last, _ := onDemandHistory.snapshot(time.Now().UnixMilli())
+		last, inflight := onDemandHistory.snapshot(time.Now().UnixMilli())
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"completed_at_ms": last.CompletedAtMs,
 			"stored_count":    last.StoredCount,
+			"request_id":      last.RequestID,
+			"chat_jid":        last.ChatJID,
+			"requested_at_ms": last.RequestedAtMs,
+			"in_flight":       inflight != nil,
 		})
 	}))
 	mux.HandleFunc("/api/history-sync", auth(func(w http.ResponseWriter, r *http.Request) {
@@ -185,14 +189,25 @@ func registerHistorySyncHandler(
 			http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusBadRequest)
 			return
 		}
+		requestedAtMs := time.Now().UnixMilli()
+		if blocking := onDemandHistory.reserve(req.ChatJID, requestedAtMs, onDemandInflightTTLMs); blocking != nil {
+			w.WriteHeader(http.StatusConflict)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"error":      "history request already in flight",
+				"request_id": blocking.RequestID,
+				"chat_jid":   blocking.ChatJID,
+			})
+			return
+		}
 		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 		defer cancel()
-		requestedAtMs := time.Now().UnixMilli()
 		response, err := client.SendPeerMessage(ctx, client.BuildHistorySyncRequest(info, count))
 		if err != nil {
+			onDemandHistory.release()
 			http.Error(w, `{"error":"history request failed"}`, http.StatusBadGateway)
 			return
 		}
+		onDemandHistory.commit(string(response.ID))
 		w.WriteHeader(http.StatusAccepted)
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"accepted":        true,
