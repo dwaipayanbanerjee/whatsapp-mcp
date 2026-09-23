@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -87,6 +88,7 @@ func newTestMessageStore(t *testing.T) *MessageStore {
 			jid TEXT PRIMARY KEY,
 			name TEXT,
 			last_message_time TIMESTAMP,
+			last_read_time TIMESTAMP,
 			ephemeral_expiration INTEGER NOT NULL DEFAULT 0,
 			ephemeral_setting_timestamp INTEGER NOT NULL DEFAULT 0
 		);
@@ -344,6 +346,69 @@ func TestUpdateChatEphemeralSettings_IgnoresOlderTimestamp(t *testing.T) {
 	}
 }
 
+// TestMarkChatRead_AdvancesButNeverRegresses locks the monotonic merge: a
+// read marker is set when absent, advances on a newer read, and is never
+// moved backwards by an older read (out-of-order receipts / history-sync
+// backfill must not un-read a chat).
+func TestMarkChatRead_AdvancesButNeverRegresses(t *testing.T) {
+	ms := newTestMessageStore(t)
+	chatJID := "15551234567@s.whatsapp.net"
+	early := time.Unix(1710000000, 0)
+	late := time.Unix(1710009999, 0)
+
+	// sets when absent (INSERT path, no prior chat row)
+	if err := ms.MarkChatRead(chatJID, early); err != nil {
+		t.Fatalf("initial mark: %v", err)
+	}
+	got1, ok := queryChatLastReadTime(ms, chatJID)
+	if !ok || got1 == "" {
+		t.Fatalf("expected last_read_time to be set, got %q ok=%v", got1, ok)
+	}
+
+	// advances on a newer read
+	if err := ms.MarkChatRead(chatJID, late); err != nil {
+		t.Fatalf("advance mark: %v", err)
+	}
+	got2, _ := queryChatLastReadTime(ms, chatJID)
+	if got2 == got1 {
+		t.Fatalf("expected last_read_time to advance from %q, still %q", got1, got2)
+	}
+
+	// does NOT regress on an older read
+	if err := ms.MarkChatRead(chatJID, early); err != nil {
+		t.Fatalf("regress mark: %v", err)
+	}
+	got3, _ := queryChatLastReadTime(ms, chatJID)
+	if got3 != got2 {
+		t.Fatalf("expected no regress from %q, got %q", got2, got3)
+	}
+}
+
+// TestIsSelfReadReceipt covers the classification used by the Receipt handler:
+// a read is "ours" when it's a DM read-self, or a group read whose participant
+// is us (IsFromMe) — but never another user reading our outgoing message.
+func TestIsSelfReadReceipt(t *testing.T) {
+	cases := []struct {
+		name   string
+		typ    types.ReceiptType
+		fromMe bool
+		want   bool
+	}{
+		{"dm read-self", types.ReceiptTypeReadSelf, false, true},
+		{"group read by us", types.ReceiptTypeRead, true, true},
+		{"other user read our message", types.ReceiptTypeRead, false, false},
+		{"delivered", types.ReceiptTypeDelivered, false, false},
+		{"sender", types.ReceiptTypeSender, false, false},
+	}
+	for _, c := range cases {
+		r := &events.Receipt{Type: c.typ}
+		r.IsFromMe = c.fromMe
+		if got := isSelfReadReceipt(r); got != c.want {
+			t.Errorf("%s: isSelfReadReceipt=%v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
 // TestExtractChatEphemeralFromMessage covers every concrete sub-message type
 // that carries ContextInfo. Each regular message in an ephemeral chat stamps
 // ContextInfo.Expiration / EphemeralSettingTimestamp; the bridge backfills
@@ -520,6 +585,14 @@ func queryChat(ms *MessageStore, jid string) (name string, found bool) {
 func queryChatLastMessageTime(ms *MessageStore, jid string) (lastMessageTime string, found bool) {
 	err := ms.db.QueryRow("SELECT last_message_time FROM chats WHERE jid = ?", jid).Scan(&lastMessageTime)
 	return lastMessageTime, err == nil
+}
+
+// queryChatLastReadTime returns the last_read_time for a chat JID as stored
+// text (NULL becomes the empty string), plus whether the row exists.
+func queryChatLastReadTime(ms *MessageStore, jid string) (lastReadTime string, found bool) {
+	var lr sql.NullString
+	err := ms.db.QueryRow("SELECT last_read_time FROM chats WHERE jid = ?", jid).Scan(&lr)
+	return lr.String, err == nil
 }
 
 // queryMessageCount returns the number of messages stored under a chat JID.
@@ -1134,9 +1207,9 @@ func TestMigrateLegacyLIDChatsToPhoneJIDs_MigratesAndIsIdempotent(t *testing.T) 
 	phoneJID := "222@s.whatsapp.net"
 
 	_, err = ms.db.Exec(`
-		INSERT INTO chats (jid, name, last_message_time) VALUES
-			(?, 'Legacy LID Name', '2026-03-01T10:00:00Z'),
-			(?, '', '2026-03-01T09:00:00Z');
+		INSERT INTO chats (jid, name, last_message_time, last_read_time) VALUES
+			(?, 'Legacy LID Name', '2026-03-01T10:00:00Z', '2026-03-01T09:30:00Z'),
+			(?, '', '2026-03-01T09:00:00Z', '2026-03-01T08:00:00Z');
 
 		INSERT INTO messages (id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length) VALUES
 			('dup', ?, 'alice', 'lid duplicate', '2026-03-01T10:00:00Z', 0, '', '', '', NULL, NULL, NULL, 0),
@@ -1177,6 +1250,14 @@ func TestMigrateLegacyLIDChatsToPhoneJIDs_MigratesAndIsIdempotent(t *testing.T) 
 	}
 	if phoneTime != "2026-03-01T10:00:00Z" {
 		t.Fatalf("expected phone chat last_message_time to be the latest (from LID chat), got %q", phoneTime)
+	}
+
+	phoneRead, readFound := queryChatLastReadTime(ms, phoneJID)
+	if !readFound || phoneRead == "" {
+		t.Fatalf("expected phone chat last_read_time to be preserved, got %q found=%v", phoneRead, readFound)
+	}
+	if phoneRead != "2026-03-01T09:30:00Z" {
+		t.Fatalf("expected last_read_time merged to later LID marker, got %q", phoneRead)
 	}
 
 	if err := ms.MigrateLegacyLIDChatsToPhoneJIDs(whatsappDBPath, logger); err != nil {
@@ -1511,6 +1592,31 @@ func captureRawWebhook(t *testing.T) (*httptest.Server, <-chan map[string]any) {
 	return srv, ch
 }
 
+// TestHandleMessage_TextWebhookPreservesIncomingMessageID verifies the text
+// message handler forwards the native incoming ID for receiver-side
+// idempotency, rather than only testing the lower-level webhook serializer.
+func TestHandleMessage_TextWebhookPreservesIncomingMessageID(t *testing.T) {
+	srv, webhookCh := captureWebhook(t)
+	t.Setenv("WEBHOOK_URL", srv.URL)
+
+	client := newTestClient(&mockLIDStore{})
+	ms := newTestMessageStore(t)
+	logger := testLogger()
+	msg := buildTextMessage(phonePN, phonePN, types.EmptyJID, types.EmptyJID, false, "text webhook")
+	msg.Info.ID = "text-webhook-msg-220"
+
+	handleMessage(client, ms, msg, logger)
+
+	select {
+	case payload := <-webhookCh:
+		if payload.MessageID != msg.Info.ID {
+			t.Errorf("messageId = %q, want incoming ID %q", payload.MessageID, msg.Info.ID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for text webhook call")
+	}
+}
+
 // TestHandleMessage_ImageOnly_WebhookForwarded verifies that an image message
 // with no text caption is forwarded to the webhook endpoint (not silently
 // dropped), and that the webhook payload contains the expected media fields.
@@ -1576,6 +1682,68 @@ func TestHandleMessage_ImageWithCaption_WebhookForwarded(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for webhook call")
+	}
+}
+
+// TestHandleMessage_WebhookDisabledDownloadsImageAsynchronously ensures the
+// webhook opt-out does not make incoming image processing wait on a download
+// solely used for the vision webhook payload.
+func TestHandleMessage_WebhookDisabledDownloadsImageAsynchronously(t *testing.T) {
+	t.Setenv("WHATSAPP_AUTO_DOWNLOAD_MEDIA", "true")
+	t.Setenv("WEBHOOK_ENABLED", "false")
+
+	client := newTestClient(&mockLIDStore{})
+	ms := newTestMessageStore(t)
+	logger := testLogger()
+	msg := buildImageMessage(phonePN, phonePN, false, "")
+	msg.Message.ImageMessage.URL = proto.String("https://example.invalid/image")
+	msg.Message.ImageMessage.MediaKey = []byte("test-media-key")
+
+	originalDownload := downloadMediaForMessage
+	downloadStarted := make(chan struct{})
+	releaseDownload := make(chan struct{})
+	downloadMediaForMessage = func(_ *whatsmeow.Client, _ *MessageStore, _ string, _ string) (bool, string, string, string, error) {
+		close(downloadStarted)
+		<-releaseDownload
+		return false, "", "", "", nil
+	}
+	t.Cleanup(func() {
+		downloadMediaForMessage = originalDownload
+		select {
+		case <-releaseDownload:
+		default:
+			close(releaseDownload)
+		}
+	})
+
+	done := make(chan struct{})
+	go func() {
+		handleMessage(client, ms, msg, logger)
+		close(done)
+	}()
+
+	select {
+	case <-downloadStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for asynchronous media download")
+	}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("message handling waited for media download while webhook was disabled")
+	}
+}
+
+func TestWebhookStartupMessage(t *testing.T) {
+	t.Setenv("WEBHOOK_ENABLED", "false")
+	if got, want := webhookStartupMessage(true), "WEBHOOK_ENABLED=false: outbound webhooks disabled"; got != want {
+		t.Errorf("disabled startup message = %q, want %q", got, want)
+	}
+
+	t.Setenv("WEBHOOK_ENABLED", "true")
+	t.Setenv("WEBHOOK_URL", "http://127.0.0.1:1/whatsapp/webhook") // opt-in: URL required
+	if got, want := webhookStartupMessage(true), "FORWARD_SELF enabled: forwarding self messages to webhook"; got != want {
+		t.Errorf("enabled startup message = %q, want %q", got, want)
 	}
 }
 
@@ -2302,6 +2470,185 @@ func TestReactHandler_NoAuth_Returns401(t *testing.T) {
 	}
 }
 
+func TestMarkReadHandler_InvalidRequests_Return400(t *testing.T) {
+	const token = "supersecrettoken1234567890abcdef"
+	handler := newRESTMux(newTestClient(&mockLIDStore{}), newTestMessageStore(t), 8080, token, nil)
+
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"empty body", `{}`},
+		{"missing message_ids", `{"chat_jid":"15551234567@s.whatsapp.net"}`},
+		{"missing chat_jid", `{"message_ids":["3AABCDEF01234567"]}`},
+		{"empty message_id", `{"message_ids":["3AABCDEF01234567",""],"chat_jid":"15551234567@s.whatsapp.net"}`},
+		{"invalid chat_jid", `{"message_ids":["3AABCDEF01234567"],"chat_jid":"@s.whatsapp.net"}`},
+		{"invalid sender_jid", `{"message_ids":["3AABCDEF01234567"],"chat_jid":"15551234567@s.whatsapp.net","sender_jid":"@s.whatsapp.net"}`},
+		{"group missing sender_jid", `{"message_ids":["3AABCDEF01234567"],"chat_jid":"120363012345678901@g.us"}`},
+		{"invalid timestamp", `{"message_ids":["3AABCDEF01234567"],"chat_jid":"15551234567@s.whatsapp.net","timestamp":"yesterday"}`},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/api/mark-read", strings.NewReader(tc.body))
+			req.Header.Set("Authorization", "Bearer "+token)
+			req.Header.Set("Content-Type", "application/json")
+			resp := httptest.NewRecorder()
+
+			handler.ServeHTTP(resp, req)
+
+			if resp.Code != http.StatusBadRequest {
+				t.Errorf("body=%q: expected 400, got %d", tc.body, resp.Code)
+			}
+		})
+	}
+}
+
+func TestMarkReadHandler_Disconnected_Returns503(t *testing.T) {
+	const token = "supersecrettoken1234567890abcdef"
+	ms := newTestMessageStore(t)
+	chatJID := "120363012345678901@g.us"
+	sender := "15551234567"
+	msgID := "3AABCDEF01234567"
+	if _, err := ms.db.Exec(
+		`INSERT INTO messages (id, chat_jid, sender, content, timestamp, is_from_me)
+		 VALUES (?, ?, ?, 'hi', ?, 0)`,
+		msgID, chatJID, sender, time.Unix(1710000000, 0),
+	); err != nil {
+		t.Fatalf("seed message: %v", err)
+	}
+	handler := newRESTMux(newTestClient(&mockLIDStore{}), ms, 8080, token, nil)
+
+	body := `{"message_ids":["3AABCDEF01234567"],"chat_jid":"120363012345678901@g.us","sender_jid":"15551234567","timestamp":"2026-08-11T18:30:00Z"}`
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/api/mark-read", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+
+	handler.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusServiceUnavailable {
+		t.Errorf("expected 503 for disconnected client, got %d body=%s", resp.Code, resp.Body.String())
+	}
+}
+
+func TestMarkReadHandler_NoAuth_Returns401(t *testing.T) {
+	const token = "supersecrettoken1234567890abcdef"
+	handler := newRESTMux(newTestClient(&mockLIDStore{}), newTestMessageStore(t), 8080, token, nil)
+
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/api/mark-read",
+		strings.NewReader(`{"message_ids":["3AABCDEF01234567"],"chat_jid":"15551234567@s.whatsapp.net"}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+
+	handler.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 without auth, got %d", resp.Code)
+	}
+}
+
+// TestResolveRecipientJID_ForMarkReadTargets locks the PN -> LID rewrite used
+// by /api/mark-read: MCP returns phone-form JIDs from messages.db, but
+// MarkRead must address migrated DMs (and group participants) by LID.
+func TestResolveRecipientJID_ForMarkReadTargets(t *testing.T) {
+	phoneChat := types.NewJID("15551234567", types.DefaultUserServer)
+	lidChat := types.NewJID("999888777666555", types.HiddenUserServer)
+	phoneSender := types.NewJID("15557654321", types.DefaultUserServer)
+	lidSender := types.NewJID("111222333444555", types.HiddenUserServer)
+	group := types.NewJID("120363012345678901", types.GroupServer)
+
+	client := newTestClient(&mockLIDStore{
+		lidByPN: map[types.JID]types.JID{
+			phoneChat:   lidChat,
+			phoneSender: lidSender,
+		},
+	})
+
+	gotChat, err := resolveRecipientJID(client, phoneChat.String())
+	if err != nil {
+		t.Fatalf("chat resolve: %v", err)
+	}
+	if gotChat != lidChat {
+		t.Fatalf("expected chat LID %s, got %s", lidChat, gotChat)
+	}
+
+	gotSender, err := resolveRecipientJID(client, phoneSender.User)
+	if err != nil {
+		t.Fatalf("sender resolve: %v", err)
+	}
+	if gotSender != lidSender {
+		t.Fatalf("expected sender LID %s, got %s", lidSender, gotSender)
+	}
+
+	gotGroup, err := resolveRecipientJID(client, group.String())
+	if err != nil {
+		t.Fatalf("group resolve: %v", err)
+	}
+	if gotGroup != group {
+		t.Fatalf("expected group JID unchanged, got %s", gotGroup)
+	}
+}
+
+func TestValidateInboundMarkRead(t *testing.T) {
+	ms := newTestMessageStore(t)
+	chat := "15551234567@s.whatsapp.net"
+	group := "120363012345678901@g.us"
+	if _, err := ms.db.Exec(`
+		INSERT INTO messages (id, chat_jid, sender, content, timestamp, is_from_me) VALUES
+			('in-dm', ?, '15551234567', 'hi', ?, 0),
+			('out-dm', ?, '15559876543', 'yo', ?, 1),
+			('in-group', ?, '15557654321', 'hi', ?, 0);
+	`, chat, time.Unix(1710000000, 0), chat, time.Unix(1710000001, 0), group, time.Unix(1710000002, 0)); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	if err := ms.ValidateInboundMarkRead(chat, "", []string{"in-dm"}); err != nil {
+		t.Fatalf("DM validate: %v", err)
+	}
+	if err := ms.ValidateInboundMarkRead(group, "15557654321@s.whatsapp.net", []string{"in-group"}); err != nil {
+		t.Fatalf("group validate: %v", err)
+	}
+	if err := ms.ValidateInboundMarkRead(chat, "", []string{"missing"}); err == nil {
+		t.Fatal("expected missing message error")
+	}
+	if err := ms.ValidateInboundMarkRead(chat, "", []string{"out-dm"}); err == nil {
+		t.Fatal("expected outbound message error")
+	}
+	if err := ms.ValidateInboundMarkRead(group, "15551234567", []string{"in-group"}); err == nil {
+		t.Fatal("expected sender mismatch error")
+	}
+}
+
+func TestMaxMessageTimestamp(t *testing.T) {
+	ms := newTestMessageStore(t)
+	chat := "15551234567@s.whatsapp.net"
+	early := time.Unix(1710000000, 0).UTC()
+	late := time.Unix(1710009999, 0).UTC()
+	if _, err := ms.db.Exec(`
+		INSERT INTO messages (id, chat_jid, sender, content, timestamp, is_from_me) VALUES
+			('a', ?, '15551234567', 'early', ?, 0),
+			('b', ?, '15551234567', 'late', ?, 0);
+	`, chat, early, chat, late); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	got, ok, err := ms.MaxMessageTimestamp(chat, []string{"a", "b"})
+	if err != nil || !ok {
+		t.Fatalf("MaxMessageTimestamp: ok=%v err=%v", ok, err)
+	}
+	if !got.Equal(late) {
+		t.Fatalf("expected %v, got %v", late, got)
+	}
+	_, ok, err = ms.MaxMessageTimestamp(chat, []string{"missing"})
+	if err != nil {
+		t.Fatalf("missing ids: %v", err)
+	}
+	if ok {
+		t.Fatal("expected ok=false for missing ids")
+	}
+}
+
 func TestHandleMessage_RegularMessageDoesNotMarkDeleted(t *testing.T) {
 	client := newTestClient(&mockLIDStore{})
 	ms := newTestMessageStore(t)
@@ -2479,6 +2826,39 @@ func TestExtractQuotedMessageInfo_ExtendedText(t *testing.T) {
 	}
 }
 
+func TestExtractMentionedJIDs_ExtendedText(t *testing.T) {
+	msg := &waProto.Message{
+		ExtendedTextMessage: &waProto.ExtendedTextMessage{
+			ContextInfo: &waProto.ContextInfo{
+				MentionedJID: []string{"491742555497@s.whatsapp.net"},
+			},
+		},
+	}
+
+	got := extractMentionedJIDs(msg)
+	if len(got) != 1 || got[0] != "491742555497@s.whatsapp.net" {
+		t.Errorf("mentioned JIDs = %#v", got)
+	}
+}
+
+func TestGetMessageIsFromMe(t *testing.T) {
+	store := newTestMessageStore(t)
+	chatJID := "15551234567@s.whatsapp.net"
+	if err := store.StoreMessage("outbound", chatJID, "15550000000", "[🤖] response", time.Now(), true, "", "", "", nil, nil, nil, 0, ""); err != nil {
+		t.Fatalf("store outbound message: %v", err)
+	}
+
+	isFromMe, err := store.GetMessageIsFromMe("outbound", chatJID)
+	if err != nil || isFromMe == nil || !*isFromMe {
+		t.Fatalf("GetMessageIsFromMe() = %v, %v; want true, nil", isFromMe, err)
+	}
+
+	missing, err := store.GetMessageIsFromMe("missing", chatJID)
+	if err != nil || missing != nil {
+		t.Fatalf("missing lookup = %v, %v; want nil, nil", missing, err)
+	}
+}
+
 // TestExtractQuotedMessageInfo_NoContextInfo verifies graceful handling when
 // the message has no ContextInfo (plain Conversation, ReactionMessage, etc.).
 func TestExtractQuotedMessageInfo_NoContextInfo(t *testing.T) {
@@ -2510,6 +2890,7 @@ func TestNewMessageStoreCreatesMessagesChatJIDIndex(t *testing.T) {
 		t.Fatalf("NewMessageStore() failed: %v", err)
 	}
 	defer func() { _ = ms.Close() }()
+	assertPermissionBits(t, "store", 0o700)
 
 	var count int
 	if err := ms.db.QueryRow(
@@ -2554,6 +2935,473 @@ func TestHistorySyncMessageInfoValidatesAndBuildsAnchor(t *testing.T) {
 	} {
 		if _, _, err := historySyncMessageInfo(bad); err == nil {
 			t.Fatalf("expected validation error for %+v", bad)
+		}
+	}
+}
+
+func TestEnsureOwnerOnlyDirectoryLeavesExistingPermissionsUntouched(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "existing")
+	if err := os.Mkdir(path, 0o700); err != nil {
+		t.Fatalf("create existing directory: %v", err)
+	}
+	if err := os.Chmod(path, 0o755); err != nil {
+		t.Fatalf("set existing directory permissions: %v", err)
+	}
+
+	if err := ensureOwnerOnlyDirectory(path); err != nil {
+		t.Fatalf("ensureOwnerOnlyDirectory(%q): %v", path, err)
+	}
+	assertPermissionBits(t, path, 0o755)
+}
+
+func TestMediaDownloadStorePathsPreserveStandardJIDs(t *testing.T) {
+	root := t.TempDir()
+	t.Chdir(root)
+	timestamp := time.Date(2026, time.September, 23, 12, 0, 0, 0, time.UTC)
+
+	for _, chatJID := range []string{
+		"15551234567@s.whatsapp.net",
+		"123456789@lid",
+		"120363000000000000@g.us",
+	} {
+		t.Run(chatJID, func(t *testing.T) {
+			chatDir, mediaPath, filename, err := mediaDownloadStorePaths(chatJID, "image", "media-message", timestamp)
+			if err != nil {
+				t.Fatalf("mediaDownloadStorePaths() error: %v", err)
+			}
+			if want := filepath.Join(root, "store", chatJID); chatDir != want {
+				t.Fatalf("chat directory = %q, want %q", chatDir, want)
+			}
+			if want := filepath.Join(chatDir, "image_20260923_120000_media-message.jpg"); mediaPath != want || filename != filepath.Base(want) {
+				t.Fatalf("media path = (%q, %q), want (%q, %q)", mediaPath, filename, want, filepath.Base(want))
+			}
+		})
+	}
+}
+
+func TestMediaDownloadStorePathsRejectTraversalIdentifiers(t *testing.T) {
+	t.Chdir(t.TempDir())
+	timestamp := time.Date(2026, time.September, 23, 12, 0, 0, 0, time.UTC)
+
+	for _, tc := range []struct {
+		name      string
+		chatJID   string
+		messageID string
+	}{
+		{name: "chat parent traversal", chatJID: "../outside", messageID: "media-message"},
+		{name: "chat absolute path", chatJID: "/tmp/outside", messageID: "media-message"},
+		{name: "message parent traversal", chatJID: "15551234567@s.whatsapp.net", messageID: "../outside"},
+		{name: "message nested traversal", chatJID: "15551234567@s.whatsapp.net", messageID: "nested/../../outside"},
+		{name: "message windows traversal", chatJID: "15551234567@s.whatsapp.net", messageID: `..\\outside`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, _, _, err := mediaDownloadStorePaths(tc.chatJID, "image", tc.messageID, timestamp); err == nil {
+				t.Fatal("expected traversal identifier to be rejected")
+			}
+		})
+	}
+}
+
+func TestDownloadMediaCreatesOwnerOnlyMediaPath(t *testing.T) {
+	t.Chdir(t.TempDir())
+	messageStore := newTestMessageStore(t)
+	chatJID := "15551234567@s.whatsapp.net"
+	messageID := "media-message"
+	timestamp := time.Date(2026, time.September, 23, 12, 0, 0, 0, time.UTC)
+	if err := messageStore.StoreChat(chatJID, "", timestamp); err != nil {
+		t.Fatalf("store chat: %v", err)
+	}
+	if err := messageStore.StoreMessage(
+		messageID, chatJID, "15557654321@s.whatsapp.net", "", timestamp, false,
+		"image", "", "https://example.invalid/media", []byte("media-key"),
+		make([]byte, 32), make([]byte, 32), 1, "",
+	); err != nil {
+		t.Fatalf("store media message: %v", err)
+	}
+
+	originalDownload := downloadMediaData
+	downloadMediaData = func(_ context.Context, _ *whatsmeow.Client, _ *MediaDownloader) ([]byte, error) {
+		return []byte("private media"), nil
+	}
+	t.Cleanup(func() { downloadMediaData = originalDownload })
+
+	success, _, _, mediaPath, err := downloadMedia(nil, messageStore, messageID, chatJID)
+	if err != nil {
+		t.Fatalf("downloadMedia() failed: %v", err)
+	}
+	if !success {
+		t.Fatal("downloadMedia() returned success=false")
+	}
+
+	assertPermissionBits(t, filepath.Join("store", chatJID), 0o700)
+	assertPermissionBits(t, mediaPath, 0o600)
+}
+
+func assertPermissionBits(t *testing.T, path string, want os.FileMode) {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat %q: %v", path, err)
+	}
+	if got := info.Mode().Perm(); got != want {
+		t.Fatalf("permissions for %q = %04o, want %04o", path, got, want)
+	}
+}
+
+func TestResolveDeviceName(t *testing.T) {
+	cases := []struct {
+		name string
+		set  bool
+		env  string
+		want string
+	}{
+		{name: "unset keeps default", set: false, want: ""},
+		{name: "empty keeps default", set: true, env: "", want: ""},
+		{name: "whitespace only keeps default", set: true, env: "   ", want: ""},
+		{name: "plain value", set: true, env: "Agent Works", want: "Agent Works"},
+		{name: "surrounding whitespace trimmed", set: true, env: "  My Assistant  ", want: "My Assistant"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.set {
+				t.Setenv("WHATSAPP_DEVICE_NAME", tc.env)
+			} else {
+				// t.Setenv restores on cleanup; unset explicitly for this case.
+				_ = os.Unsetenv("WHATSAPP_DEVICE_NAME")
+			}
+			if got := resolveDeviceName(); got != tc.want {
+				t.Fatalf("resolveDeviceName() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestResolveMentionJIDs verifies mapping of mention entries to the JID
+// strings placed in ContextInfo.MentionedJID, including the dual phone+LID
+// form for LID-addressed groups.
+func TestResolveMentionJIDs(t *testing.T) {
+	phonePN := types.JID{User: "12025551234", Server: types.DefaultUserServer}
+	phoneLID := types.JID{User: "111222333444555", Server: types.HiddenUserServer}
+	lidStore := &mockLIDStore{lidByPN: map[types.JID]types.JID{phonePN: phoneLID}}
+	client := newTestClient(lidStore)
+
+	cases := []struct {
+		name     string
+		mentions []string
+		want     []string
+	}{
+		{
+			"phone number with LID mapping yields both forms",
+			[]string{"12025551234"},
+			[]string{phonePN.String(), phoneLID.String()},
+		},
+		{
+			"phone number without LID mapping yields phone JID only",
+			[]string{"19998887777"},
+			[]string{"19998887777@" + types.DefaultUserServer},
+		},
+		{
+			"explicit LID JID passed through unchanged",
+			[]string{phoneLID.String()},
+			[]string{phoneLID.String()},
+		},
+		{
+			"unparseable entry skipped",
+			[]string{"1.2.3@s.whatsapp.net", "12025551234"},
+			[]string{phonePN.String(), phoneLID.String()},
+		},
+		{
+			"empty input yields nil",
+			nil,
+			nil,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := resolveMentionJIDs(client, tc.mentions)
+			if len(got) != len(tc.want) {
+				t.Fatalf("resolveMentionJIDs(%v) = %v, want %v", tc.mentions, got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Errorf("resolveMentionJIDs(%v)[%d] = %q, want %q", tc.mentions, i, got[i], tc.want[i])
+				}
+			}
+		})
+	}
+}
+
+// TestSendHandler_MentionsField_PassedThrough proves the mentions JSON field
+// is parsed by /api/send — mirrors the quoted-reply field test above.
+func TestSendHandler_MentionsField_PassedThrough(t *testing.T) {
+	const token = "supersecrettoken1234567890abcdef"
+	handler := newRESTMux(newTestClient(&mockLIDStore{}), newTestMessageStore(t), 8080, token, nil)
+
+	// POST with mentions but no recipient — should 400 before any send
+	// attempt, proving the new field parses without error.
+	body := `{"recipient":"","message":"hi @12025551234","mentions":["12025551234"]}`
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/api/send", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for empty recipient with mentions field, got %d", resp.Code)
+	}
+}
+
+// --- Outbound media persistence ---
+//
+// sendWhatsAppMessage needs a live, connected *whatsmeow.Client to reach
+// client.Upload/client.SendMessage, so these tests cover the two pieces
+// that don't: outboundMediaRow, the pure function that derives what gets
+// persisted from an upload response, and StoreMessage's own round-trip
+// through SQLite. Both are checked against hasCompleteMediaInfo, the same
+// predicate downloadMedia uses to decide whether a row is downloadable.
+
+// TestOutboundMediaRow_PopulatedUpload_SatisfiesRedownloadCheck verifies
+// that a populated upload response maps to a downloadable row.
+func TestOutboundMediaRow_PopulatedUpload_SatisfiesRedownloadCheck(t *testing.T) {
+	upload := whatsmeow.UploadResponse{
+		URL:           "https://mmg.whatsapp.net/v/t62.7161-24/sticker.enc",
+		DirectPath:    "/v/t62.7161-24/sticker.enc",
+		MediaKey:      []byte{0x01, 0x02, 0x03, 0x04},
+		FileSHA256:    []byte{0xaa, 0xbb, 0xcc},
+		FileEncSHA256: []byte{0xdd, 0xee, 0xff},
+		FileLength:    30524,
+	}
+
+	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := outboundMediaRow("/tmp/wa-test/test-sticker.webp", upload)
+
+	if mediaType != "image" {
+		t.Errorf("mediaType = %q, want %q", mediaType, "image")
+	}
+	if filename != "test-sticker.webp" {
+		t.Errorf("filename = %q, want %q", filename, "test-sticker.webp")
+	}
+	if !hasCompleteMediaInfo(url, mediaKey, fileSHA256, fileEncSHA256, fileLength) {
+		t.Errorf("outboundMediaRow result is incomplete, would fail downloadMedia's check: url=%q keyLen=%d shaLen=%d encShaLen=%d len=%d",
+			url, len(mediaKey), len(fileSHA256), len(fileEncSHA256), fileLength)
+	}
+
+	// Check values, not just non-empty — a FileSHA256/FileEncSHA256 swap
+	// compiles cleanly and hasCompleteMediaInfo alone wouldn't catch it.
+	if url != upload.URL {
+		t.Errorf("url = %q, want %q", url, upload.URL)
+	}
+	if !bytes.Equal(mediaKey, upload.MediaKey) {
+		t.Errorf("mediaKey = %x, want %x", mediaKey, upload.MediaKey)
+	}
+	if !bytes.Equal(fileSHA256, upload.FileSHA256) {
+		t.Errorf("fileSHA256 = %x, want %x (upload.FileSHA256) — check for a FileSHA256/FileEncSHA256 swap", fileSHA256, upload.FileSHA256)
+	}
+	if !bytes.Equal(fileEncSHA256, upload.FileEncSHA256) {
+		t.Errorf("fileEncSHA256 = %x, want %x (upload.FileEncSHA256) — check for a FileSHA256/FileEncSHA256 swap", fileEncSHA256, upload.FileEncSHA256)
+	}
+	if fileLength != upload.FileLength {
+		t.Errorf("fileLength = %d, want %d", fileLength, upload.FileLength)
+	}
+}
+
+// TestOutboundMediaRow_PreservesMetadataForAllMediaTypes verifies that each
+// outbound category stores the upload metadata needed by downloadMedia.
+func TestOutboundMediaRow_PreservesMetadataForAllMediaTypes(t *testing.T) {
+	upload := whatsmeow.UploadResponse{
+		URL:           "https://mmg.whatsapp.net/v/t62.7161-24/upload.enc",
+		MediaKey:      []byte{0x01, 0x02, 0x03, 0x04},
+		FileSHA256:    []byte{0xaa, 0xbb, 0xcc},
+		FileEncSHA256: []byte{0xdd, 0xee, 0xff},
+		FileLength:    30524,
+	}
+	cases := []struct {
+		path      string
+		mediaType string
+	}{
+		{path: "/tmp/wa-test/photo.jpg", mediaType: "image"},
+		{path: "/tmp/wa-test/voice.ogg", mediaType: "audio"},
+		{path: "/tmp/wa-test/clip.mp4", mediaType: "video"},
+		{path: "/tmp/wa-test/report.pdf", mediaType: "document"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.mediaType, func(t *testing.T) {
+			gotType, _, gotURL, gotKey, gotSHA, gotEncSHA, gotLength := outboundMediaRow(tc.path, upload)
+			if gotType != tc.mediaType {
+				t.Errorf("mediaType = %q, want %q", gotType, tc.mediaType)
+			}
+			if !hasCompleteMediaInfo(gotURL, gotKey, gotSHA, gotEncSHA, gotLength) {
+				t.Fatal("outbound media row is incomplete")
+			}
+			if gotURL != upload.URL || !bytes.Equal(gotKey, upload.MediaKey) ||
+				!bytes.Equal(gotSHA, upload.FileSHA256) || !bytes.Equal(gotEncSHA, upload.FileEncSHA256) ||
+				gotLength != upload.FileLength {
+				t.Fatal("outbound media metadata does not match the upload response")
+			}
+		})
+	}
+}
+
+// TestOutboundMediaRow_EmptyMediaPath_ReturnsEmpty verifies the text-message
+// case (mediaPath == "") stays a no-media row, matching the previous
+// inline behavior exactly — no ambiguity between "no media" and "upload
+// returned an empty value".
+func TestOutboundMediaRow_EmptyMediaPath_ReturnsEmpty(t *testing.T) {
+	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := outboundMediaRow("", whatsmeow.UploadResponse{})
+
+	if mediaType != "" || filename != "" {
+		t.Errorf("expected empty mediaType/filename for mediaPath=\"\", got mediaType=%q filename=%q", mediaType, filename)
+	}
+	if hasCompleteMediaInfo(url, mediaKey, fileSHA256, fileEncSHA256, fileLength) {
+		t.Fatalf("expected incomplete media info for a text message, got a complete row")
+	}
+}
+
+// queryMediaFields reads back the columns downloadMedia's own query selects,
+// for the first message stored under a chat JID.
+func queryMediaFields(t *testing.T, ms *MessageStore, chatJID, msgID string) (url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) {
+	t.Helper()
+	err := ms.db.QueryRow(
+		"SELECT url, media_key, file_sha256, file_enc_sha256, file_length FROM messages WHERE id = ? AND chat_jid = ?",
+		msgID, chatJID,
+	).Scan(&url, &mediaKey, &fileSHA256, &fileEncSHA256, &fileLength)
+	if err != nil {
+		t.Fatalf("failed to query stored message: %v", err)
+	}
+	return
+}
+
+// TestStoreMessage_MediaFields_RoundTrip verifies that populated upload
+// metadata (the shape sendWhatsAppMessage now passes) round-trips through
+// SQLite intact and satisfies hasCompleteMediaInfo. mediaType is "image",
+// not "sticker": the outbound path classifies every .webp as "image" (see
+// main.go's extension switch) — "sticker" is only ever written on the
+// inbound path (extractMediaInfo).
+func TestStoreMessage_MediaFields_RoundTrip(t *testing.T) {
+	ms := newTestMessageStore(t)
+	chatJID := "50372269345@s.whatsapp.net"
+
+	url := "https://mmg.whatsapp.net/v/t62.7161-24/sticker.enc"
+	mediaKey := []byte{0x01, 0x02, 0x03, 0x04}
+	fileSHA256 := []byte{0xaa, 0xbb, 0xcc}
+	fileEncSHA256 := []byte{0xdd, 0xee, 0xff}
+	var fileLength uint64 = 30524
+
+	if err := ms.StoreMessage(
+		"OUTBOUND1", chatJID, "50372269345", "", time.Now(), true,
+		"image", "test-sticker.webp", url, mediaKey, fileSHA256, fileEncSHA256, fileLength, "",
+	); err != nil {
+		t.Fatalf("StoreMessage failed: %v", err)
+	}
+
+	gotURL, gotKey, gotSHA, gotEncSHA, gotLen := queryMediaFields(t, ms, chatJID, "OUTBOUND1")
+	if !hasCompleteMediaInfo(gotURL, gotKey, gotSHA, gotEncSHA, gotLen) {
+		t.Errorf("stored media row is incomplete, would fail downloadMedia's check: url=%q keyLen=%d shaLen=%d encShaLen=%d len=%d",
+			gotURL, len(gotKey), len(gotSHA), len(gotEncSHA), gotLen)
+	}
+
+	// Check values, not just non-empty — same rationale as
+	// TestOutboundMediaRow_PopulatedUpload_SatisfiesRedownloadCheck above.
+	if gotURL != url {
+		t.Errorf("url = %q, want %q", gotURL, url)
+	}
+	if !bytes.Equal(gotKey, mediaKey) {
+		t.Errorf("mediaKey = %x, want %x", gotKey, mediaKey)
+	}
+	if !bytes.Equal(gotSHA, fileSHA256) {
+		t.Errorf("fileSHA256 = %x, want %x — check for a file_sha256/file_enc_sha256 column swap", gotSHA, fileSHA256)
+	}
+	if !bytes.Equal(gotEncSHA, fileEncSHA256) {
+		t.Errorf("fileEncSHA256 = %x, want %x — check for a file_sha256/file_enc_sha256 column swap", gotEncSHA, fileEncSHA256)
+	}
+	if gotLen != fileLength {
+		t.Errorf("fileLength = %d, want %d", gotLen, fileLength)
+	}
+}
+
+// TestStoreMessage_EmptyMediaFields_FailsRedownloadCheck documents the shape
+// sendWhatsAppMessage used to pass unconditionally ("", nil, nil, nil, 0)
+// regardless of what client.Upload actually returned. A row stored this way
+// must fail hasCompleteMediaInfo — this is what made every outbound
+// attachment un-redownloadable before the fix.
+func TestStoreMessage_EmptyMediaFields_FailsRedownloadCheck(t *testing.T) {
+	ms := newTestMessageStore(t)
+	chatJID := "50372269345@s.whatsapp.net"
+
+	if err := ms.StoreMessage(
+		"OUTBOUND2", chatJID, "50372269345", "", time.Now(), true,
+		"image", "test-sticker.webp", "", nil, nil, nil, 0, "",
+	); err != nil {
+		t.Fatalf("StoreMessage failed: %v", err)
+	}
+
+	gotURL, gotKey, gotSHA, gotEncSHA, gotLen := queryMediaFields(t, ms, chatJID, "OUTBOUND2")
+	if hasCompleteMediaInfo(gotURL, gotKey, gotSHA, gotEncSHA, gotLen) {
+		t.Fatalf("expected incomplete media info (the pre-fix bug shape), got a complete row")
+	}
+}
+
+// TestRenderPairingQRCodes_RendersEveryCode is the regression guard for the
+// rotated-code path. WhatsApp answers a QR scan with a companion_reg_refresh
+// notification, whatsmeow rotates the ADV secret and pushes a fresh code down
+// the channel, and only that rotated code can still complete the handshake.
+// Rendering only the first code leaves a stale one on screen: the phone then
+// validates against a secret the server has already dropped and reports
+// "check your connection" while pairing never completes.
+func TestRenderPairingQRCodes_RendersEveryCode(t *testing.T) {
+	qrChan := make(chan whatsmeow.QRChannelItem, 3)
+	qrChan <- whatsmeow.QRChannelItem{Event: "code", Code: "first-code"}
+	qrChan <- whatsmeow.QRChannelItem{Event: "code", Code: "rotated-code"}
+	qrChan <- whatsmeow.QRChannelItem{Event: "success"}
+	close(qrChan)
+
+	var rendered []string
+	var out strings.Builder
+	outcome := renderPairingQRCodes(qrChan, &out, func(code string, w io.Writer) {
+		rendered = append(rendered, code)
+	})
+
+	if outcome != pairingQRSucceeded {
+		t.Errorf("outcome = %v, want pairingQRSucceeded", outcome)
+	}
+	want := []string{"first-code", "rotated-code"}
+	if len(rendered) != len(want) {
+		t.Fatalf("rendered %d code(s) (%v), want %d — a rotated code that is never\n"+
+			"rendered cannot be scanned, which is exactly how pairing stalls", len(rendered), rendered, len(want))
+	}
+	for i := range want {
+		if rendered[i] != want[i] {
+			t.Errorf("rendered[%d] = %q, want %q", i, rendered[i], want[i])
+		}
+	}
+	if !strings.Contains(out.String(), "refreshed") {
+		t.Errorf("second code was not announced as refreshed; output:\n%s", out.String())
+	}
+}
+
+// TestRenderPairingQRCodes_Outcomes covers the two non-success verdicts: the
+// server running out of codes, and the channel draining without a verdict.
+func TestRenderPairingQRCodes_Outcomes(t *testing.T) {
+	cases := []struct {
+		name  string
+		items []whatsmeow.QRChannelItem
+		want  pairingQROutcome
+	}{
+		{"timeout", []whatsmeow.QRChannelItem{{Event: "code", Code: "c"}, {Event: "timeout"}}, pairingQRTimedOut},
+		{"closed without verdict", []whatsmeow.QRChannelItem{{Event: "code", Code: "c"}}, pairingQRChannelClosed},
+		{"unknown events are skipped", []whatsmeow.QRChannelItem{{Event: "err-unexpected-state"}}, pairingQRChannelClosed},
+	}
+	for _, c := range cases {
+		qrChan := make(chan whatsmeow.QRChannelItem, len(c.items))
+		for _, it := range c.items {
+			qrChan <- it
+		}
+		close(qrChan)
+		got := renderPairingQRCodes(qrChan, io.Discard, func(code string, w io.Writer) {})
+		if got != c.want {
+			t.Errorf("%s: outcome = %v, want %v", c.name, got, c.want)
 		}
 	}
 }
