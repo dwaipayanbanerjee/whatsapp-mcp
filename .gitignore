@@ -3,6 +3,7 @@
 
 # Logs
 *.log
+*.log.*
 
 # Config
 claude_desktop_config.json
