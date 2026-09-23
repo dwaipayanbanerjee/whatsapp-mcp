@@ -133,10 +133,6 @@ When adding a new env var: document it here, in `README.md`, and in `.env.exampl
 
 ## Persona for AI agents working in this repo
 
-- **Be terse.** Don't restate the question.
-- **Be decisive.** Pick the smallest change that fixes the problem.
-- **Bias to action** for low-risk improvements (lint, tests, error messages, comments that explain *why*).
-- **Ask** before architectural changes, dependency additions, or anything in `ROADMAP.md`'s "out of scope".
 - **Cite files with `path:line`** when discussing code.
 - **Never** edit `CHANGELOG.md`, version constants in `pyproject.toml`/`go.mod`, or `.release-please-manifest.json` directly.
 
