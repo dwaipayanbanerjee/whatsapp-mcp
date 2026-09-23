@@ -54,7 +54,7 @@ func isExpiredMediaErr(err error) bool {
 
 // recoverViaMediaRetry asks the sender's phone to re-upload expired media,
 // waits for the retry notification, and downloads from the fresh direct path.
-func recoverViaMediaRetry(client *whatsmeow.Client, messageStore *MessageStore, messageID, chatJID string, dl *MediaDownloader) ([]byte, error) {
+func recoverViaMediaRetryContext(ctx context.Context, client *whatsmeow.Client, messageStore *MessageStore, messageID, chatJID string, dl *MediaDownloader) ([]byte, error) {
 	chat, err := types.ParseJID(chatJID)
 	if err != nil {
 		return nil, fmt.Errorf("parse chat jid: %w", err)
@@ -62,7 +62,7 @@ func recoverViaMediaRetry(client *whatsmeow.Client, messageStore *MessageStore, 
 	var sender string
 	var isFromMe bool
 	var ts time.Time
-	err = messageStore.db.QueryRow(
+	err = messageStore.db.QueryRowContext(ctx,
 		"SELECT sender, is_from_me, timestamp FROM messages WHERE id = ? AND chat_jid = ?",
 		messageID, chatJID,
 	).Scan(&sender, &isFromMe, &ts)
@@ -97,13 +97,15 @@ func recoverViaMediaRetry(client *whatsmeow.Client, messageStore *MessageStore, 
 	defer mediaRetryWaiters.Delete(messageID)
 
 	fmt.Printf("📡 Media expired for %s; asking sender's phone to re-upload...\n", messageID)
-	if err := client.SendMediaRetryReceipt(context.Background(), info, dl.MediaKey); err != nil {
+	if err := client.SendMediaRetryReceipt(ctx, info, dl.MediaKey); err != nil {
 		return nil, fmt.Errorf("send media retry receipt: %w", err)
 	}
 
 	var evt *events.MediaRetry
 	select {
 	case evt = <-ch:
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	case <-time.After(mediaRetryTimeout):
 		return nil, fmt.Errorf("media retry timed out after %s (sender's phone offline or unresponsive)", mediaRetryTimeout)
 	}
@@ -120,7 +122,7 @@ func recoverViaMediaRetry(client *whatsmeow.Client, messageStore *MessageStore, 
 		return nil, fmt.Errorf("media retry succeeded but returned no direct path")
 	}
 
-	data, err := client.DownloadMediaWithPath(context.Background(), directPath, dl.FileEncSHA256, dl.FileSHA256, dl.MediaKey, dl.MediaType, "", false)
+	data, err := client.DownloadMediaWithPath(ctx, directPath, dl.FileEncSHA256, dl.FileSHA256, dl.MediaKey, dl.MediaType, "", false)
 	if err != nil {
 		return nil, fmt.Errorf("download after media retry: %w", err)
 	}

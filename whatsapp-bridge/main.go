@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/binary"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"math"
 	"math/rand"
 	"mime"
@@ -729,6 +731,8 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 		qmid = quotedMessageId
 	}
 
+	// Sparse history can omit media recovery metadata that a live copy already
+	// supplied. Preserve it so replaying history cannot strand a cached file.
 	_, err := store.db.Exec(
 		`INSERT INTO messages
 		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length, quoted_message_id)
@@ -738,13 +742,13 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 			content = excluded.content,
 			timestamp = excluded.timestamp,
 			is_from_me = excluded.is_from_me,
-			media_type = excluded.media_type,
-			filename = excluded.filename,
-			url = excluded.url,
-			media_key = excluded.media_key,
-			file_sha256 = excluded.file_sha256,
-			file_enc_sha256 = excluded.file_enc_sha256,
-			file_length = excluded.file_length,
+			media_type = COALESCE(NULLIF(excluded.media_type, ''), messages.media_type),
+			filename = COALESCE(NULLIF(excluded.filename, ''), messages.filename),
+			url = COALESCE(NULLIF(excluded.url, ''), messages.url),
+			media_key = CASE WHEN length(excluded.media_key) > 0 THEN excluded.media_key ELSE messages.media_key END,
+			file_sha256 = CASE WHEN length(excluded.file_sha256) > 0 THEN excluded.file_sha256 ELSE messages.file_sha256 END,
+			file_enc_sha256 = CASE WHEN length(excluded.file_enc_sha256) > 0 THEN excluded.file_enc_sha256 ELSE messages.file_enc_sha256 END,
+			file_length = CASE WHEN excluded.file_length > 0 THEN excluded.file_length ELSE messages.file_length END,
 			quoted_message_id = COALESCE(excluded.quoted_message_id, messages.quoted_message_id)`,
 		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, qmid,
 	)
@@ -1798,6 +1802,10 @@ func (d *MediaDownloader) GetMediaType() whatsmeow.MediaType {
 
 // Function to download media from a message
 func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, messageID, chatJID string) (bool, string, string, string, error) {
+	return downloadMediaWithContext(context.Background(), client, messageStore, messageID, chatJID)
+}
+
+func downloadMediaWithContext(ctx context.Context, client *whatsmeow.Client, messageStore *MessageStore, messageID, chatJID string) (bool, string, string, string, error) {
 	// Query the database for the message including timestamp
 	var mediaType, url string
 	var mediaKey, fileSHA256, fileEncSHA256 []byte
@@ -1806,7 +1814,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	var err error
 
 	// Get media info AND timestamp from the database
-	err = messageStore.db.QueryRow(
+	err = messageStore.db.QueryRowContext(ctx,
 		"SELECT media_type, url, media_key, file_sha256, file_enc_sha256, file_length, timestamp FROM messages WHERE id = ? AND chat_jid = ?",
 		messageID, chatJID,
 	).Scan(&mediaType, &url, &mediaKey, &fileSHA256, &fileEncSHA256, &fileLength, &timestamp)
@@ -1856,10 +1864,11 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		return false, "", "", "", fmt.Errorf("failed to get absolute path: %v", err)
 	}
 
-	// Check if file already exists
-	if _, err := os.Stat(localPath); err == nil {
-		// File exists, return it
-		fmt.Printf("📁 File already exists: %s\n", absPath)
+	// A previous interrupted write must not count as a captured attachment.
+	if verifiedMediaFile(localPath, fileSHA256, fileLength) {
+		if _, err := messageStore.db.ExecContext(ctx, "UPDATE messages SET filename = ? WHERE id = ? AND chat_jid = ?", filename, messageID, chatJID); err != nil {
+			return false, "", "", "", fmt.Errorf("failed to record media filename: %w", err)
+		}
 		return true, mediaType, filename, absPath, nil
 	}
 
@@ -1903,24 +1912,69 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Download the media using whatsmeow client
-	mediaData, err := client.Download(context.Background(), downloader)
+	mediaData, err := client.Download(ctx, downloader)
 	if err != nil && isExpiredMediaErr(err) {
 		// CDN copy is gone (WhatsApp expires media server-side). Fall back to
 		// the official client's recovery path: ask the sender's phone to
 		// re-upload, then fetch from the fresh direct path. See mediaretry.go.
-		mediaData, err = recoverViaMediaRetry(client, messageStore, messageID, chatJID, downloader)
+		mediaData, err = recoverViaMediaRetryContext(ctx, client, messageStore, messageID, chatJID, downloader)
 	}
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
 
 	// Save the downloaded media to file
-	if err := os.WriteFile(localPath, mediaData, 0644); err != nil {
+	if err := writeMediaFile(localPath, mediaData); err != nil {
 		return false, "", "", "", fmt.Errorf("failed to save media file: %v", err)
+	}
+	if _, err := messageStore.db.ExecContext(ctx, "UPDATE messages SET filename = ? WHERE id = ? AND chat_jid = ?", filename, messageID, chatJID); err != nil {
+		return false, "", "", "", fmt.Errorf("failed to record media filename: %w", err)
 	}
 
 	fmt.Printf("Successfully downloaded %s media to %s (%d bytes)\n", mediaType, absPath, len(mediaData))
 	return true, mediaType, filename, absPath, nil
+}
+
+// Media is published atomically, after the file contents are flushed. This
+// prevents a killed download from leaving a partial file that later looks done.
+func writeMediaFile(path string, data []byte) error {
+	file, err := os.CreateTemp(filepath.Dir(path), ".media-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(file.Name())
+	defer file.Close()
+	if err := file.Chmod(0644); err != nil {
+		return err
+	}
+	if _, err := file.Write(data); err != nil {
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	return os.Rename(file.Name(), path)
+}
+
+func verifiedMediaFile(path string, expectedHash []byte, expectedLength uint64) bool {
+	if len(expectedHash) != sha256.Size || expectedLength == 0 {
+		return false
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() || uint64(info.Size()) != expectedLength {
+		return false
+	}
+	digest := sha256.New()
+	_, err = io.Copy(digest, file)
+	return err == nil && bytes.Equal(digest.Sum(nil), expectedHash)
 }
 
 // Extract direct path from a WhatsApp media URL
@@ -2367,6 +2421,10 @@ func main() {
 		return
 	}
 
+	// Preserve the notification session ID; the automatic HistorySync event
+	// contains only the downloaded blob and cannot identify its request.
+	client.ManualHistorySyncDownload = true
+
 	// Initialize message store
 	messageStore, err := NewMessageStore()
 	if err != nil {
@@ -2385,6 +2443,9 @@ func main() {
 		return
 	}
 
+	historyWorker := newHistorySyncProcessor(client, messageStore, onDemandHistory, logger)
+	defer historyWorker.close()
+
 	// Channel to signal reconnection needs
 	reconnectChan := make(chan bool, 1)
 
@@ -2392,12 +2453,9 @@ func main() {
 	client.AddEventHandler(func(evt interface{}) {
 		switch v := evt.(type) {
 		case *events.Message:
-			// Process regular messages
-			handleMessage(client, messageStore, v, logger)
-
-		case *events.HistorySync:
-			// Process history sync events
-			handleHistorySync(client, messageStore, v, logger)
+			if !historyWorker.enqueue(v) {
+				handleMessage(client, messageStore, v, logger)
+			}
 
 		case *events.MediaRetry:
 			// Response to a SendMediaRetryReceipt issued by downloadMedia's
@@ -2646,6 +2704,8 @@ connectionSuccess:
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)
 	signal.Notify(exitChan, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(exitChan)
+	shutdown := make(chan struct{})
 
 	fmt.Println("REST server is running. Press Ctrl+C to disconnect and exit.")
 
@@ -2687,7 +2747,7 @@ connectionSuccess:
 					reconnectBackoff = time.Second * 5
 				}
 
-			case <-exitChan:
+			case <-shutdown:
 				return
 			}
 		}
@@ -2695,6 +2755,8 @@ connectionSuccess:
 
 	// Wait for termination signal
 	<-exitChan
+	close(shutdown)
+	historyWorker.close()
 
 	fmt.Println("Disconnecting...")
 	// Disconnect client
@@ -2874,47 +2936,25 @@ func handleCallOffer(client *whatsmeow.Client, messageStore *MessageStore, meta 
 }
 
 type historyMediaDownload struct {
-	MessageID     string
-	ChatJID       string
-	MediaType     string
-	URL           string
-	MediaKey      []byte
-	FileSHA256    []byte
-	FileEncSHA256 []byte
-	FileLength    uint64
+	MessageID string
+	ChatJID   string
 }
 
-func (task historyMediaDownload) eligible() bool {
-	return task.MessageID != "" &&
-		task.ChatJID != "" &&
-		task.MediaType != "" &&
-		task.URL != "" &&
-		len(task.MediaKey) > 0 &&
-		len(task.FileSHA256) > 0 &&
-		len(task.FileEncSHA256) > 0 &&
-		task.FileLength > 0
+// historySyncResult separates storage from media work so a request cannot be
+// marked complete while its attachments are still being downloaded.
+type historySyncResult struct {
+	storedCount   int
+	storageErrors int
+	mediaTasks    []historyMediaDownload
+	messages      []historyMessageRef
 }
 
-func queueHistoryMediaDownloads(
-	client *whatsmeow.Client,
-	messageStore *MessageStore,
-	tasks []historyMediaDownload,
-	logger waLog.Logger,
-) {
-	if len(tasks) == 0 {
-		return
+func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, historySync *events.HistorySync, logger waLog.Logger) historySyncResult {
+	result := historySyncResult{}
+	if historySync == nil || historySync.Data == nil {
+		result.storageErrors++
+		return result
 	}
-	go func() {
-		for _, task := range tasks {
-			success, _, _, _, err := downloadMedia(client, messageStore, task.MessageID, task.ChatJID)
-			if !success || err != nil {
-				logger.Warnf("History media capture failed for message %s in %s: %v", task.MessageID, task.ChatJID, err)
-			}
-		}
-	}()
-}
-
-func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, historySync *events.HistorySync, logger waLog.Logger) {
 	// Log every history sync event with its shape. Different sync types
 	// carry different payloads; logging type/chunk/progress makes it easy
 	// to reason about what arrived from WhatsApp when debugging.
@@ -2925,11 +2965,10 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 		len(historySync.Data.Conversations),
 	)
 
-	syncedCount := 0
-	mediaDownloads := make([]historyMediaDownload, 0)
 	for _, conversation := range historySync.Data.Conversations {
 		// Parse JID from the conversation
-		if conversation.ID == nil {
+		if conversation == nil || conversation.GetID() == "" {
+			result.storageErrors++
 			continue
 		}
 
@@ -2937,8 +2976,9 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 
 		// Try to parse the JID
 		jid, err := types.ParseJID(rawChatJID)
-		if err != nil {
-			logger.Warnf("Failed to parse JID %s: %v", rawChatJID, err)
+		if err != nil || jid.User == "" || jid.Server == "" {
+			result.storageErrors++
+			logger.Warnf("History conversation has an invalid JID")
 			continue
 		}
 
@@ -2954,31 +2994,46 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 		// Process messages
 		messages := conversation.Messages
 		if len(messages) > 0 {
-			// Update chat with latest message timestamp
-			latestMsg := messages[0]
-			if latestMsg == nil || latestMsg.Message == nil {
+			// A malformed first row must not hide later valid rows, and provider
+			// ordering must not move the conversation's latest timestamp backward.
+			var latestTimestamp uint64
+			for _, msg := range messages {
+				if msg != nil && msg.Message != nil && msg.Message.GetMessageTimestamp() > latestTimestamp {
+					latestTimestamp = msg.Message.GetMessageTimestamp()
+				}
+			}
+			if latestTimestamp == 0 {
+				for _, msg := range messages {
+					if msg == nil || msg.Message == nil {
+						result.storageErrors++
+						continue
+					}
+					mediaType, _, _, _, _, _, _ := extractMediaInfo(msg.Message.Message, time.Unix(0, 0), msg.Message.GetKey().GetID())
+					if extractTextContent(msg.Message.Message) != "" || mediaType != "" {
+						result.storageErrors++
+					}
+				}
 				continue
 			}
-
-			// Get timestamp from message info
-			ts := latestMsg.Message.GetMessageTimestamp()
-			if ts == 0 {
+			timestamp := time.Unix(int64(latestTimestamp), 0)
+			if err := messageStore.StoreChat(chatJID, name, timestamp); err != nil {
+				result.storageErrors++
+				logger.Warnf("Failed to store history chat: %v", err)
 				continue
 			}
-			timestamp := time.Unix(int64(ts), 0)
-
-			_ = messageStore.StoreChat(chatJID, name, timestamp)
 			if err := messageStore.UpdateChatEphemeralSettings(
 				chatJID,
 				conversation.GetEphemeralExpiration(),
 				conversation.GetEphemeralSettingTimestamp(),
 			); err != nil {
-				logger.Warnf("Failed to store history sync ephemeral settings for %s: %v", chatJID, err)
+				result.storageErrors++
+				logger.Warnf("Failed to store history sync ephemeral settings: %v", err)
 			}
 
 			// Store messages
 			for _, msg := range messages {
 				if msg == nil || msg.Message == nil {
+					result.storageErrors++
 					continue
 				}
 
@@ -3002,11 +3057,15 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 				}
 
 				if msg.Message.Message != nil {
-					mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength = extractMediaInfo(msg.Message.Message, timestamp, histMsgID)
+					mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength = extractMediaInfo(msg.Message.Message, time.Unix(int64(msg.Message.GetMessageTimestamp()), 0), histMsgID)
 				}
 
 				// Skip messages with no content and no media
 				if content == "" && mediaType == "" {
+					continue
+				}
+				if histMsgID == "" || msg.Message.GetMessageTimestamp() == 0 {
+					result.storageErrors++
 					continue
 				}
 
@@ -3041,18 +3100,8 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					sender = jid.User
 				}
 
-				// Store message
-				msgID := ""
-				if msg.Message.Key != nil && msg.Message.Key.ID != nil {
-					msgID = *msg.Message.Key.ID
-				}
-
-				// Get message timestamp
-				ts := msg.Message.GetMessageTimestamp()
-				if ts == 0 {
-					continue
-				}
-				msgTimestamp := time.Unix(int64(ts), 0)
+				msgID := histMsgID
+				msgTimestamp := time.Unix(int64(msg.Message.GetMessageTimestamp()), 0)
 
 				err = messageStore.StoreMessage(
 					msgID,
@@ -3071,36 +3120,27 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					quotedMessageId,
 				)
 				if err != nil {
+					result.storageErrors++
 					logger.Warnf("Failed to store history message: %v", err)
 				} else {
-					task := historyMediaDownload{
-						MessageID:     msgID,
-						ChatJID:       chatJID,
-						MediaType:     mediaType,
-						URL:           url,
-						MediaKey:      mediaKey,
-						FileSHA256:    fileSHA256,
-						FileEncSHA256: fileEncSHA256,
-						FileLength:    fileLength,
-					}
-					if task.eligible() {
-						mediaDownloads = append(mediaDownloads, task)
+					// Capture using the stored row: an older existing row may have
+					// usable metadata or a cached file missing from this payload.
+					if mediaType != "" {
+						result.mediaTasks = append(result.mediaTasks, historyMediaDownload{MessageID: msgID, ChatJID: chatJID})
 					}
 					// Deliberately no per-message log here: a full-history sync
 					// stores tens of thousands of messages, and logging each one
 					// both drowns the log and writes private message content to
 					// disk. The per-chunk summary below is enough to follow along.
-					syncedCount++
+					result.storedCount++
+					result.messages = append(result.messages, historyMessageRef{ChatJID: chatJID, MessageID: msgID})
 				}
 			}
 		}
 	}
 
-	queueHistoryMediaDownloads(client, messageStore, mediaDownloads, logger)
-	if historySync.Data.GetSyncType() == waProto.HistorySync_ON_DEMAND {
-		markOnDemandHistoryComplete(time.Now().UnixMilli(), syncedCount)
-	}
-	fmt.Printf("History sync complete. Stored %d messages.\n", syncedCount)
+	logger.Infof("History chunk stored: messages=%d storage_errors=%d media_pending=%d", result.storedCount, result.storageErrors, len(result.mediaTasks))
+	return result
 }
 
 // analyzeOggOpus tries to extract duration and generate a simple waveform from an Ogg Opus file

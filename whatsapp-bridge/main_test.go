@@ -2557,31 +2557,3 @@ func TestHistorySyncMessageInfoValidatesAndBuildsAnchor(t *testing.T) {
 		}
 	}
 }
-
-func TestOnDemandHistoryCompletionIsObservable(t *testing.T) {
-	markOnDemandHistoryComplete(123456789, 37)
-	last, _ := onDemandHistory.snapshot(123456790)
-	if last.CompletedAtMs != 123456789 || last.StoredCount != 37 {
-		t.Fatalf("unexpected completion status: %+v", last)
-	}
-}
-
-func TestHistoryMediaDownloadEligibleRequiresRecoverableMediaMetadata(t *testing.T) {
-	complete := historyMediaDownload{
-		MessageID:     "media-1",
-		ChatJID:       "15551234567@s.whatsapp.net",
-		MediaType:     "image",
-		URL:           "https://mmg.whatsapp.net/media",
-		MediaKey:      []byte{1},
-		FileSHA256:    []byte{2},
-		FileEncSHA256: []byte{3},
-		FileLength:    42,
-	}
-	if !complete.eligible() {
-		t.Fatal("complete media metadata should be queued for durable download")
-	}
-	complete.URL = ""
-	if complete.eligible() {
-		t.Fatal("media without a URL must not be queued")
-	}
-}

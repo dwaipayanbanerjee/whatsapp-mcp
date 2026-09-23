@@ -499,7 +499,7 @@ rm whatsapp-bridge/store/whatsapp.db
 cd whatsapp-bridge
 ./whatsapp-bridge --full-history-pair
 # Scan the QR with WhatsApp → Settings → Linked Devices → Link a Device
-# Wait for "History sync complete" in the logs (can take 10-30 minutes)
+# Monitor "History chunk processed" logs; each entry covers one chunk
 # Ctrl+C when sync has quiesced, then restart under your normal process manager
 ```
 
@@ -508,6 +508,20 @@ Caveats:
 - **The phone decides the actual cap.** The flag requests up to 10 years / 100 GB, but WhatsApp's iOS primary device enforces its own retention policy. iPad companion is documented at ~1 year max; other linked devices appear to follow similar logic.
 - **Only effective on a fresh pair.** With `whatsapp.db` already present, no new pair handshake fires and the flag is a no-op.
 - **Messages the phone has deleted are not recoverable** — auto-expire, low-storage cleanup, and manual delete all leave no trace for the phone to share.
+
+### On-demand history API
+
+`POST /api/history-sync` requests a bounded batch before a known message;
+`GET /api/history-sync/status?request_id=...` polls that exact request. Both use
+the REST bearer token. Protocol version 2 reports completion only after the
+phone echoes the reserved request ID, sends explicit 100% progress, and all
+notified chunks and their media finish storing successfully. The status includes
+exact persisted message references; `stored_count` includes existing upserts.
+
+Missing progress, downloads or storage failures, and restarted/expired requests
+remain unconfirmed or failed. A quiet interval is never treated as completion.
+The phone controls the history it makes available. Manual history downloading
+uses public whatsmeow hooks and one bounded worker; no dependency fork is needed.
 
 ## Call History
 
