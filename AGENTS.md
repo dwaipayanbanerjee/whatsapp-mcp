@@ -102,12 +102,23 @@ A failing blocking job is a hard block — fix it or explain in the PR why it's 
 | `WHATSAPP_BRIDGE_PORT` | `8080` | Port the bridge binds to |
 | `WHATSAPP_BRIDGE_TOKEN` | generated next to `WHATSMEOW_DB_PATH` as `.bridge-token` | Bearer token required for bridge REST calls |
 | `WHATSAPP_MEDIA_ROOTS` | `~/.local/share/whatsapp-mcp/outbox` | Path-list of directories allowed for outbound media files |
+| `WHATSAPP_DEVICE_NAME` | `whatsmeow` (whatsmeow default) | Linked-device label shown in WhatsApp > Linked Devices. Applied at pair time only (`store.DeviceProps.Os`); re-pair to change |
 | `WHATSAPP_MCP_TRANSPORT` | `stdio` | MCP transport to serve clients: `stdio`, `http`, or `sse` |
 | `WHATSAPP_MCP_HOST` | `127.0.0.1` | Bind address for the `http`/`sse` transports |
 | `WHATSAPP_MCP_PORT` | `8000` | Port for the `http`/`sse` transports |
-| `WEBHOOK_URL` | `http://localhost:8769/whatsapp/webhook` | Outgoing webhook for incoming messages (empty = disabled) |
+| `WEBHOOK_URL` | unset | Outgoing webhook for incoming messages (unset or empty = disabled; opt-in) |
+| `WEBHOOK_ENABLED` | `true` | Set to `false` to disable outbound webhooks even when `WEBHOOK_URL` is set |
+| `WHATSAPP_AUTO_DOWNLOAD_MEDIA` | `true` | Automatically download incoming media, including webhook image bytes. `false` keeps webhook metadata/text without `mediaBase64` and leaves downloads to `/api/download` (`download_media`); delayed downloads may fail after media expires. Status messages are stored but never auto-downloaded or forwarded |
 | `FORWARD_SELF` | `true` | Whether self-sent messages are forwarded (`getEnvBool` default; set `FORWARD_SELF=false` to disable) |
 | `WHATSAPP_LOG_LEVEL` | `INFO` | Bridge log verbosity: `DEBUG`, `INFO`, `WARN`, or `ERROR` |
+| `WHATSAPP_PARENT_WATCHDOG_S` | `30` | Stdio parent-liveness poll interval (seconds). Exits when the original parent is gone (POSIX reparent). Soft stdin EOF alone does not exit. |
+| `WHISPER_MODEL` | unset | Required model-file path for default whisper.cpp transcription |
+| `WHISPER_LANGUAGE` | `auto` | Language for whisper.cpp transcription |
+| `WHATSAPP_TRANSCRIPTION_PROVIDER` | `whisper_cpp` | `whisper_cpp` or `openai_compatible`; transcription is opt-in via the tool |
+| `WHATSAPP_TRANSCRIPTION_URL` | unset | Required full HTTP(S) endpoint for `openai_compatible`; audio is uploaded here, use loopback to keep it local |
+| `WHATSAPP_TRANSCRIPTION_MODEL` | unset | Required model ID for the HTTP provider (e.g. `parakeet`) |
+| `WHATSAPP_TRANSCRIPTION_LANGUAGE` | `auto` | HTTP provider language; `auto` omits the language field |
+| `WHATSAPP_TRANSCRIPTION_API_KEY` | unset | Optional bearer token for the HTTP provider |
 
 When adding a new env var: document it here, in `README.md`, and in `.env.example`.
 
@@ -116,7 +127,7 @@ When adding a new env var: document it here, in `README.md`, and in `.env.exampl
 1. **JIDs.** WhatsApp identifies users as `1234567890@s.whatsapp.net` (DM), `123456@g.us` (group), and `<random>@lid` (link-ID, anonymous). The bridge maintains a phone↔LID map in `whatsapp.db.whatsmeow_lid_map`. Many "user is missing" / "messages don't show" bugs trace back to JID-form mismatches. Always think about both forms.
 2. **Media files** live under `store/{chat_jid}/` with timestamp + message-ID filenames. Don't hand-construct these paths in client code; use the bridge's `/api/download` endpoint.
 3. **Audio.** WhatsApp voice messages must be Opus `.ogg`. The MCP server's `send_audio_message` tool auto-converts via FFmpeg if installed.
-4. **History sync** is controlled by the *primary* device (the phone). The bridge can request more (see the `--full-history-pair` flag), but the phone has the final word.
+4. **History sync** is controlled by the *primary* device (the phone). The bridge can request more at pair time (see the `--full-history-pair` flag) or for a single chat at runtime (`POST /api/history`, see `history_ondemand.go`), but the phone has the final word.
 5. **`messages.db` is the source of truth for the MCP server.** Don't make the MCP server dependent on the bridge being up for *read* operations.
 6. **Outgoing calls are not visible to linked devices.** Don't promise features that depend on them.
 

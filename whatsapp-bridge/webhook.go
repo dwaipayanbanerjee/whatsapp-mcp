@@ -17,19 +17,43 @@ const maxMediaBase64Bytes = 10 * 1024 * 1024 // 10 MB
 
 // webhookClient is used for all outbound webhook POSTs. The 30-second timeout
 // prevents a slow or unreachable endpoint from blocking message handling
-// indefinitely.
-var webhookClient = &http.Client{Timeout: 30 * time.Second}
+// indefinitely. Redirects are never followed: WEBHOOK_URL is a single
+// operator-configured endpoint, not a browsable URL, and following a 3xx
+// would forward X-Bridge-Token to whatever host the redirect names — Go only
+// strips Authorization/Cookie on cross-origin redirects, not custom headers.
+var webhookClient = &http.Client{
+	Timeout: 30 * time.Second,
+	CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	},
+}
+
+// webhookAuthToken is the shared bridge token attached as an
+// "X-Bridge-Token" header to every outbound webhook POST. It is populated
+// once at startup from loadOrCreateBridgeToken() (see auth.go and main.go) —
+// the same token the bridge already requires on inbound /api/* requests.
+// When empty (no token configured yet) the header is omitted so deployments
+// that predate the token rollout keep working. The receiving hub enforces
+// this token on its inbound webhook route once its own WHATSAPP_BRIDGE_TOKEN
+// is set to the matching value (autohub PR #898), which accepts the token via
+// this header or "Authorization: Bearer". A dedicated header is used here
+// (rather than Authorization) so it never collides with a receiver's own
+// Authorization-based auth — e.g. HTTP Basic auth that net/http derives
+// automatically from credentials embedded in WEBHOOK_URL.
+var webhookAuthToken string
 
 // WebhookPayload represents the data sent to the webhook
 type WebhookPayload struct {
-	EventType       string `json:"eventType,omitempty"`
-	Sender          string `json:"sender"`
-	Content         string `json:"content"`
-	ChatJID         string `json:"chatJID"`
-	IsFromMe        bool   `json:"isFromMe"`
-	QuotedMessageId string `json:"quotedMessageId,omitempty"`
-	QuotedSender    string `json:"quotedSender,omitempty"`
-	QuotedContent   string `json:"quotedContent,omitempty"`
+	EventType       string   `json:"eventType,omitempty"`
+	Sender          string   `json:"sender"`
+	Content         string   `json:"content"`
+	ChatJID         string   `json:"chatJID"`
+	IsFromMe        bool     `json:"isFromMe"`
+	QuotedMessageId string   `json:"quotedMessageId,omitempty"`
+	QuotedSender    string   `json:"quotedSender,omitempty"`
+	QuotedContent   string   `json:"quotedContent,omitempty"`
+	QuotedIsFromMe  *bool    `json:"quotedIsFromMe,omitempty"`
+	MentionedJIDs   []string `json:"mentionedJids,omitempty"`
 	// Media fields - populated when the message contains an image attachment
 	MessageID     string `json:"messageId,omitempty"`
 	MediaType     string `json:"mediaType,omitempty"`
@@ -42,16 +66,22 @@ type WebhookPayload struct {
 	ReactionRemoved     *bool   `json:"reactionRemoved,omitempty"`
 }
 
-// sendWebhookPayload marshals and POSTs a WebhookPayload to WEBHOOK_URL.
-// The webhook is OPT-IN: when WEBHOOK_URL is unset or empty, no HTTP request
-// is made. (There is deliberately no default endpoint — an unconfigured
-// webhook used to dial localhost:8769 on every message and log a connection
-// error each time.)
+// webhooksEnabled reports whether webhook processing is enabled. Keep this
+// separate from sendWebhookPayload so media callers can avoid their webhook-only
+// file work when delivery is disabled.
+// Webhooks are opt-in: no request is made unless WEBHOOK_URL is set, and
+// WEBHOOK_ENABLED=false turns them off even when it is.
+func webhooksEnabled() bool {
+	return os.Getenv("WEBHOOK_URL") != "" && getEnvBool("WEBHOOK_ENABLED", true)
+}
+
+// sendWebhookPayload marshals and POSTs a WebhookPayload to the configured webhook URL.
 func sendWebhookPayload(payload WebhookPayload) {
-	webhookURL := os.Getenv("WEBHOOK_URL")
-	if webhookURL == "" {
+	if !webhooksEnabled() {
 		return
 	}
+
+	webhookURL := os.Getenv("WEBHOOK_URL")
 
 	jsonData, err := json.Marshal(payload)
 	if err != nil {
@@ -59,7 +89,21 @@ func sendWebhookPayload(payload WebhookPayload) {
 		return
 	}
 
-	resp, err := webhookClient.Post(webhookURL, "application/json", bytes.NewBuffer(jsonData))
+	req, err := http.NewRequest(http.MethodPost, webhookURL, bytes.NewBuffer(jsonData))
+	if err != nil {
+		fmt.Printf("Error building webhook request: %v\n", err)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	// Authenticate to the hub's fail-closed inbound webhook route with the
+	// shared bridge token, via a dedicated header so it can never clobber a
+	// receiver's own Authorization-based auth (see webhookAuthToken doc
+	// comment above). WEBHOOK_URL is always operator-set here (opt-in).
+	if webhookAuthToken != "" {
+		req.Header.Set("X-Bridge-Token", webhookAuthToken)
+	}
+
+	resp, err := webhookClient.Do(req)
 	if err != nil {
 		fmt.Printf("Error sending webhook: %v\n", err)
 		return
@@ -73,8 +117,16 @@ func sendWebhookPayload(payload WebhookPayload) {
 	}
 }
 
-// SendWebhook sends a text-only message to the webhook endpoint.
-func SendWebhook(sender, content, chatJID string, isFromMe bool, quotedMessageId, quotedSender, quotedContent string) {
+// SendWebhook sends a text-only message to the webhook endpoint. New callers
+// should use SendWebhookWithMessageID so receiver-side idempotency can identify
+// repeated WhatsApp events; this wrapper remains for compatibility.
+func SendWebhook(sender, content, chatJID string, isFromMe bool, quotedMessageId, quotedSender, quotedContent string, quotedIsFromMe *bool, mentionedJIDs []string) {
+	SendWebhookWithMessageID(sender, content, chatJID, isFromMe, quotedMessageId, quotedSender, quotedContent, quotedIsFromMe, mentionedJIDs, "")
+}
+
+// SendWebhookWithMessageID sends a text-only message and preserves the native
+// WhatsApp message ID in the payload for downstream idempotency.
+func SendWebhookWithMessageID(sender, content, chatJID string, isFromMe bool, quotedMessageId, quotedSender, quotedContent string, quotedIsFromMe *bool, mentionedJIDs []string, messageID string) {
 	sendWebhookPayload(WebhookPayload{
 		Sender:          sender,
 		Content:         content,
@@ -83,6 +135,9 @@ func SendWebhook(sender, content, chatJID string, isFromMe bool, quotedMessageId
 		QuotedMessageId: quotedMessageId,
 		QuotedSender:    quotedSender,
 		QuotedContent:   quotedContent,
+		QuotedIsFromMe:  quotedIsFromMe,
+		MentionedJIDs:   mentionedJIDs,
+		MessageID:       messageID,
 	})
 }
 
@@ -93,8 +148,13 @@ func SendWebhookWithMedia(
 	sender, content, chatJID string,
 	isFromMe bool,
 	quotedMessageId, quotedSender, quotedContent string,
+	quotedIsFromMe *bool, mentionedJIDs []string,
 	messageID, mediaType, mimeType, mediaFilename, localPath string,
 ) {
+	if !webhooksEnabled() {
+		return
+	}
+
 	var mediaBase64 string
 	if localPath != "" {
 		info, statErr := os.Stat(localPath)
@@ -117,6 +177,8 @@ func SendWebhookWithMedia(
 		QuotedMessageId: quotedMessageId,
 		QuotedSender:    quotedSender,
 		QuotedContent:   quotedContent,
+		QuotedIsFromMe:  quotedIsFromMe,
+		MentionedJIDs:   mentionedJIDs,
 		MessageID:       messageID,
 		MediaType:       mediaType,
 		MimeType:        mimeType,
