@@ -819,7 +819,11 @@ Caveats:
 `GET /api/history-sync/status?request_id=...` polls that exact request. Both use
 the REST bearer token. Protocol version 2 reports completion only after the
 phone echoes the reserved request ID, sends explicit 100% progress, and all
-notified chunks and their media finish storing successfully. The status includes
+notified chunks and their media finish storing successfully. The request uses
+a verified LID when available while storage keeps its canonical phone JID.
+`addressing: "phone"` selects the phone-number route as a bounded fallback for
+a missing response; `request_chat_jid` and any `fallback_addressing` are reported
+separately from canonical `chat_jid`. The status includes
 exact persisted message references; `stored_count` includes existing upserts.
 
 Missing progress, downloads or storage failures, and restarted/expired requests

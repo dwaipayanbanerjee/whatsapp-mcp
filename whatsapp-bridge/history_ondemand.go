@@ -186,6 +186,12 @@ func registerHistoryEndpoint(mux *http.ServeMux, auth func(http.HandlerFunc) htt
 		}
 
 		info := historyAnchorInfo(chatJID, id, fromMe, ts)
+		requestChat, err := historyRequestChat(r.Context(), client, chatJID, "auto")
+		if err != nil {
+			writeErr(http.StatusInternalServerError, err.Error())
+			return
+		}
+		info.Chat = requestChat
 
 		msg := client.BuildHistorySyncRequest(&info, count)
 		if msg == nil {

@@ -1811,6 +1811,13 @@ func resolveLIDChat(client *whatsmeow.Client, chat, senderAlt, recipientAlt type
 	if chat.Server != types.HiddenUserServer {
 		return chat
 	}
+	// The paired account itself is a verified PN/LID pair even when no live
+	// message alt or contact-store entry accompanies a history conversation.
+	if client != nil && client.Store != nil && chat.ToNonAD() == client.Store.GetLID().ToNonAD() {
+		if own := client.Store.GetJID().ToNonAD(); !own.IsEmpty() {
+			return own
+		}
+	}
 
 	// For incoming DMs the phone JID is in SenderAlt;
 	// for outgoing DMs it is in RecipientAlt.

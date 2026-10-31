@@ -23,6 +23,7 @@ type historySyncStatus struct {
 	RequestID       string              `json:"request_id"`
 	SessionID       string              `json:"session_id,omitempty"`
 	ChatJID         string              `json:"chat_jid,omitempty"`
+	RequestChatJID  string              `json:"request_chat_jid,omitempty"`
 	RequestedAtMs   int64               `json:"requested_at_ms"`
 	CompletedAtMs   int64               `json:"completed_at_ms"`
 	StoredCount     int                 `json:"stored_count"`
@@ -239,12 +240,52 @@ func (t *onDemandTracker) snapshot(requestID string, nowMs int64) historySyncSta
 
 var onDemandHistory = &onDemandTracker{}
 
+func (t *onDemandTracker) setRequestChat(requestID, chatJID string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if r := t.records[requestID]; r != nil {
+		r.RequestChatJID = chatJID
+	}
+}
+
 type historySyncRequest struct {
-	ChatJID   string `json:"chat_jid"`
-	MessageID string `json:"message_id"`
-	Timestamp string `json:"timestamp"`
-	IsFromMe  bool   `json:"is_from_me"`
-	Count     int    `json:"count"`
+	ChatJID    string `json:"chat_jid"`
+	MessageID  string `json:"message_id"`
+	Timestamp  string `json:"timestamp"`
+	IsFromMe   bool   `json:"is_from_me"`
+	Count      int    `json:"count"`
+	Addressing string `json:"addressing,omitempty"`
+}
+
+// The archive stores a canonical phone JID, but the primary device may file
+// that conversation under its verified LID. Those are distinct contracts:
+// asking the phone by its display/storage identity can be acknowledged by the
+// server yet never produce history. Keep the canonical ID for storage/status.
+func historyRequestChat(ctx context.Context, client *whatsmeow.Client, chat types.JID, addressing string) (types.JID, error) {
+	if addressing != "" && addressing != "auto" && addressing != "phone" {
+		return types.EmptyJID, fmt.Errorf("addressing must be auto or phone")
+	}
+	if chat.Server == types.GroupServer || addressing == "phone" {
+		return chat, nil
+	}
+	if client == nil || client.Store == nil {
+		return chat, nil
+	}
+	if chat == client.Store.GetJID().ToNonAD() {
+		if lid := client.Store.GetLID().ToNonAD(); !lid.IsEmpty() && lid.Server == types.HiddenUserServer {
+			return lid, nil
+		}
+	}
+	if client.Store.LIDs != nil {
+		lid, err := client.Store.LIDs.GetLIDForPN(ctx, chat)
+		if err != nil {
+			return types.EmptyJID, fmt.Errorf("could not resolve history request identity")
+		}
+		if !lid.IsEmpty() && lid.Server == types.HiddenUserServer {
+			return lid.ToNonAD(), nil
+		}
+	}
+	return chat, nil
 }
 
 func historySyncMessageInfo(req historySyncRequest) (*types.MessageInfo, int, error) {
@@ -305,6 +346,11 @@ func registerHistorySyncHandler(mux *http.ServeMux, client *whatsmeow.Client, au
 			http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusBadRequest)
 			return
 		}
+		requestChat, err := historyRequestChat(r.Context(), client, info.Chat, req.Addressing)
+		if err != nil {
+			http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusBadRequest)
+			return
+		}
 		requestedAtMs := time.Now().UnixMilli()
 		requestID := client.GenerateMessageID()
 		if blocking := onDemandHistory.reserve(string(requestID), req.ChatJID, requestedAtMs, onDemandInflightTTLMs); blocking != nil {
@@ -316,6 +362,8 @@ func registerHistorySyncHandler(mux *http.ServeMux, client *whatsmeow.Client, au
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 		defer cancel()
+		onDemandHistory.setRequestChat(string(requestID), requestChat.String())
+		info.Chat = requestChat
 		// SendPeerMessage generates its ID inside the send. Supplying it here
 		// makes the reservation visible even if history arrives before the ACK.
 		_, err = client.SendMessage(ctx, client.Store.GetJID().ToNonAD(), client.BuildHistorySyncRequest(info, count), whatsmeow.SendRequestExtra{Peer: true, ID: requestID})
@@ -327,9 +375,14 @@ func registerHistorySyncHandler(mux *http.ServeMux, client *whatsmeow.Client, au
 			}
 		}
 		w.WriteHeader(http.StatusAccepted)
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		result := map[string]interface{}{
 			"accepted": true, "protocol_version": 2, "request_id": requestID,
 			"requested_at_ms": requestedAtMs, "chat_jid": req.ChatJID, "count": count,
-		})
+			"request_chat_jid": requestChat.String(),
+		}
+		if requestChat.Server == types.HiddenUserServer && req.Addressing != "phone" {
+			result["fallback_addressing"] = "phone"
+		}
+		_ = json.NewEncoder(w).Encode(result)
 	}))
 }
