@@ -22,6 +22,7 @@ func TestHistoryRequestChatSeparatesCanonicalIdentityFromRequestIdentity(t *test
 		{"explicit auto uses verified LID", pn, "auto", lid},
 		{"bounded fallback retains phone", pn, "phone", pn},
 		{"group remains group", group, "auto", group},
+		{"LID chat remains LID", lid, "auto", lid},
 		{"unmapped phone remains phone", types.NewJID("15550000002", types.DefaultUserServer), "auto", types.NewJID("15550000002", types.DefaultUserServer)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

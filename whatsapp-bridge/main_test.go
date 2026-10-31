@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -35,6 +36,10 @@ type mockLIDStore struct {
 }
 
 func (m *mockLIDStore) GetLIDForPN(_ context.Context, pn types.JID) (types.JID, error) {
+	// Mirror whatsmeow's CachedLIDMap, which rejects non-PN input.
+	if pn.Server != types.DefaultUserServer {
+		return types.EmptyJID, fmt.Errorf("invalid GetLIDForPN call with non-PN JID %s", pn)
+	}
 	if lid, ok := m.lidByPN[pn]; ok {
 		return lid, nil
 	}

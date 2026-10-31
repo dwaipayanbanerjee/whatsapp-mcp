@@ -265,7 +265,7 @@ func historyRequestChat(ctx context.Context, client *whatsmeow.Client, chat type
 	if addressing != "" && addressing != "auto" && addressing != "phone" {
 		return types.EmptyJID, fmt.Errorf("addressing must be auto or phone")
 	}
-	if chat.Server == types.GroupServer || addressing == "phone" {
+	if chat.Server != types.DefaultUserServer || addressing == "phone" {
 		return chat, nil
 	}
 	if client == nil || client.Store == nil {
